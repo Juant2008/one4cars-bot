@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode');
 const http = require('http');
@@ -7,6 +7,44 @@ const fs = require('fs');
 const path = require('path');
 const mysql = require('mysql2/promise');
 const axios = require('axios');
+const Tesseract = require('tesseract.js');
+
+// ===== LECTURA DE IMÁGENES / PEDIDOS POR OCR (GRATUITO con Tesseract.js) =====
+let tesseractWorker = null;
+async function getOcrWorker() {
+    if (!tesseractWorker) {
+        try {
+            // 'spa' = idioma español (se descarga automáticamente la primera vez)
+            tesseractWorker = await Tesseract.createWorker('spa');
+            console.log("[OCR] ✅ Worker de Tesseract listo (español).");
+        } catch (e) {
+            console.log("[OCR] Error creando worker Tesseract:", e.message);
+            tesseractWorker = null;
+        }
+    }
+    return tesseractWorker;
+}
+
+async function reiniciarOcrWorker() {
+    try { if (tesseractWorker) await tesseractWorker.terminate(); } catch (e) {}
+    tesseractWorker = null;
+}
+
+async function extraerTextoDeImagen(msg) {
+    try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, pino({ level: 'silent' }));
+        if (!buffer || buffer.length === 0) return null;
+        const worker = await getOcrWorker();
+        if (!worker) return null;
+        const { data } = await worker.recognize(buffer);
+        const texto = (data.text || '').trim();
+        return texto || null;
+    } catch (e) {
+        console.log("[OCR] Error al leer la imagen:", e.message);
+        try { await reiniciarOcrWorker(); } catch (e2) {}
+        return null;
+    }
+}
 
 // CAPTURA GLOBAL DE ERRORES EVITA QUE EL BOT MUERA
 process.on('unhandledRejection', (err) => {
@@ -2062,7 +2100,17 @@ async function startBot() {
             }
 
             const pushName = msg.pushName || "Usuario";
-            const rawText = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim();
+            let rawText = (msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || "").trim();
+
+            // ===== LECTURA DE PEDIDOS POR IMAGEN (OCR GRATUITO) =====
+            if (!rawText && msg.message.imageMessage) {
+                console.log(`[IMG] Imagen recibida de ${from.split('@')[0]}, extrayendo pedido con OCR...`);
+                const textoOcr = await extraerTextoDeImagen(msg);
+                if (textoOcr && textoOcr.length > 0) {
+                    rawText = textoOcr;
+                    console.log(`[IMG] Texto OCR detectado: ${rawText.substring(0, 250)}`);
+                }
+            }
             if (!rawText) return;
 
             const text = normalizar(rawText);
