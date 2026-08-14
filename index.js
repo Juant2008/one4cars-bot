@@ -8,6 +8,7 @@ const path = require('path');
 const mysql = require('mysql2/promise');
 const axios = require('axios');
 const Tesseract = require('tesseract.js');
+const sharp = require('sharp');
 
 // ===== LECTURA DE IMÁGENES / PEDIDOS POR OCR (GRATUITO con Tesseract.js) =====
 let tesseractWorker = null;
@@ -30,13 +31,28 @@ async function reiniciarOcrWorker() {
     tesseractWorker = null;
 }
 
+async function preprocesarImagen(buffer) {
+    try {
+        return await sharp(buffer)
+            .resize({ width: 2000, withoutEnlargement: false })
+            .grayscale()
+            .sharpen()
+            .linear(1.8, -40)
+            .toBuffer();
+    } catch (e) {
+        console.log("[OCR] No se pudo pre-procesar la imagen:", e.message);
+        return buffer;
+    }
+}
+
 async function extraerTextoDeImagen(msg) {
     try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {}, pino({ level: 'silent' }));
         if (!buffer || buffer.length === 0) return null;
+        const buffPre = await preprocesarImagen(buffer);
         const worker = await getOcrWorker();
         if (!worker) return null;
-        const { data } = await worker.recognize(buffer);
+        const { data } = await worker.recognize(buffPre);
         const texto = (data.text || '').trim();
         return texto || null;
     } catch (e) {
@@ -44,6 +60,37 @@ async function extraerTextoDeImagen(msg) {
         try { await reiniciarOcrWorker(); } catch (e2) {}
         return null;
     }
+}
+
+// Corrige errores típicos de OCR en códigos de producto (1→L, 4→A, 0→O, 8→B, etc.)
+function variantesCodigoOcr(codigo) {
+    const mapa = {
+        'O': '0', 'o': '0', 'Q': '0', 'D': '0', 'J': '0',
+        'l': '1', 'L': '1', 'I': '1', 'i': '1', '|': '1', '!': '1',
+        'A': '4', 'Z': '2', 'z': '2', 'S': '5', 's': '5', 'B': '8',
+        'G': '6', 'T': '7'
+    };
+    const variantes = new Set([codigo.toUpperCase()]);
+    // Variante totalmente normalizada: "MFLALO" → "MF1410"
+    variantes.add(codigo.toUpperCase().split('').map(ch => mapa[ch] || ch).join(''));
+    // Reemplazos simples (un solo carácter)
+    for (let i = 0; i < codigo.length; i++) {
+        const ch = codigo[i];
+        if (mapa[ch]) variantes.add(codigo.slice(0, i) + mapa[ch] + codigo.slice(i + 1));
+    }
+    // Reemplazos dobles (dos caracteres)
+    for (let i = 0; i < codigo.length && variantes.size < 16; i++) {
+        const ch = codigo[i];
+        if (!mapa[ch]) continue;
+        for (let j = i + 1; j < codigo.length; j++) {
+            const ch2 = codigo[j];
+            if (mapa[ch2]) {
+                variantes.add(codigo.slice(0, i) + mapa[ch] + codigo.slice(i + 1, j) + mapa[ch2] + codigo.slice(j + 1));
+            }
+            if (variantes.size >= 16) break;
+        }
+    }
+    return [...variantes];
 }
 
 // CAPTURA GLOBAL DE ERRORES EVITA QUE EL BOT MUERA
@@ -1258,13 +1305,20 @@ async function obtenerPorcentaje() {
 
 async function buscarProductoPorCodigo(codigo) {
     const codLimpio = codigo.trim();
+    const candidatos = [codLimpio, ...variantesCodigoOcr(codLimpio)];
     try {
         const sql = `SELECT producto, descripcion, tipo, precio_minimo, (cantidad_existencia + cantidad_existencia_almacen) as stock_total, cantidad_fabricando FROM tab_productos WHERE producto = ? LIMIT 1`;
-        const [rows] = await pool.execute(sql, [codLimpio]);
-        if (rows.length > 0) return rows;
+        for (const cand of candidatos) {
+            const [rows] = await pool.execute(sql, [cand]);
+            if (rows.length > 0) return rows;
+        }
         if (/^\d+$/.test(codLimpio)) {
             const [rows2] = await pool.execute(`SELECT producto, descripcion, tipo, precio_minimo, (cantidad_existencia + cantidad_existencia_almacen) as stock_total, cantidad_fabricando FROM tab_productos WHERE producto LIKE ? LIMIT 1`, [`%${codLimpio}%`]);
             if (rows2.length > 0) return rows2;
+        }
+        for (const cand of candidatos.slice(1)) {
+            const [rows3] = await pool.execute(`SELECT producto, descripcion, tipo, precio_minimo, (cantidad_existencia + cantidad_existencia_almacen) as stock_total, cantidad_fabricando FROM tab_productos WHERE producto LIKE ? LIMIT 1`, [`%${cand}%`]);
+            if (rows3.length > 0) return rows3;
         }
     } catch (e) {
         console.log("Error buscando por código exacto:", e.message);
@@ -1439,7 +1493,10 @@ function parseMultiItemMessage(rawText) {
 async function processMultiItemProduct(from, item, multiOrder) {
     const pct = await obtenerPorcentaje();
     multiOrder.pct = pct;
-    const prods = await buscarProductoPorTexto(item.descripcion);
+    let prods = null;
+    const codCand = (item.descripcion || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    if (codCand.length >= 3) prods = await buscarProductoPorCodigo(codCand);
+    if (!prods || prods.length === 0) prods = await buscarProductoPorTexto(item.descripcion);
     if (!prods || prods.length === 0) {
         multiOrder.resolvedItems.push({ descripcion: item.descripcion, cantidad: item.cantidad, error: true, producto: null });
         multiOrder.currentIndex++;
