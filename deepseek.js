@@ -4,14 +4,27 @@ const path = require('path');
 
 // ===== CONFIGURACIÓN DEEPSEEK =====
 // La API key se lee de la variable de entorno DEEPSEEK_API_KEY (recomendado en Render),
-// o de un archivo deepseek_key.txt en la misma carpeta para uso local.
-let API_KEY = process.env.DEEPSEEK_API_KEY || (() => {
+// o de un archivo deepseek_key.txt en la misma carpeta (también lo escribe el comando `ia key`).
+const KEY_FILE = path.join(__dirname, 'deepseek_key.txt');
+
+function leerKey() {
+    const env = (process.env.DEEPSEEK_API_KEY || '').trim();
+    if (env) return env;
     try {
-        const kf = path.join(__dirname, 'deepseek_key.txt');
-        if (fs.existsSync(kf)) return fs.readFileSync(kf, 'utf8').trim();
+        if (fs.existsSync(KEY_FILE)) return fs.readFileSync(KEY_FILE, 'utf8').trim();
     } catch (e) {}
     return '';
-})();
+}
+
+let API_KEY = leerKey();
+
+function persistirKey(key) {
+    try {
+        fs.writeFileSync(KEY_FILE, key.trim(), 'utf8');
+    } catch (e) {
+        console.log('[IA] No se pudo guardar deepseek_key.txt:', e.message);
+    }
+}
 
 const MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
 const API_URL = 'https://api.deepseek.com/chat/completions';
@@ -125,13 +138,16 @@ function estaHabilitada() {
     return iaHabilitada && Date.now() >= cooldownHasta;
 }
 
-// Actualiza la API key en caliente (para uso local o por comando)
+// Actualiza la API key en caliente y la guarda para que sobreviva reinicios
 function setKey(key) {
     if (key) {
-        API_KEY = key;
+        API_KEY = key.trim();
+        persistirKey(API_KEY);
         iaHabilitada = true;
         cooldownHasta = 0;
+        return true;
     }
+    return false;
 }
 
 // Permite forzar estado (para comandos de admin)
