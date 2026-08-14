@@ -2135,6 +2135,37 @@ async function startBot() {
                 }
             }
 
+            // --- 0a. COMANDOS DE IA (ADMIN) — se procesan primero para que no se confundan con productos/menú ---
+            if (isAdmin && (text === 'ia' || text === 'estado ia' || text === 'ia on' || text === 'ia off' || text.startsWith('ia key ') || text === 'saldo' || text === 'saldo ia' || text === 'saldo deeepseek' || text === 'ia saldo')) {
+                if (text === 'ia' || text === 'estado ia') {
+                    return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n${ia.estaHabilitada() ? '🟢 Activa (respondiendo con deepseek-chat)' : '🔴 Desactivada o en espera (bot clásico)'}` });
+                }
+                if (text === 'ia on') {
+                    ia.forzarEstado(true);
+                    return await safeSendMessage(from, { text: "🤖 IA DeepSeek *activada*. Responderá con deepseek-chat mientras haya saldo." });
+                }
+                if (text === 'ia off') {
+                    ia.forzarEstado(false);
+                    return await safeSendMessage(from, { text: "🤖 IA DeepSeek *desactivada*. El bot vuelve al modo clásico." });
+                }
+                if (text.startsWith('ia key ')) {
+                    const matchKey = rawText.match(/ia\s*key\s+([^\s]+)/i);
+                    const nuevaKey = matchKey ? matchKey[1] : '';
+                    if (nuevaKey.length < 10) {
+                        return await safeSendMessage(from, { text: "❌ La key parece inválida. Envíe: ia key sk-..." });
+                    }
+                    ia.setKey(nuevaKey);
+                    return await safeSendMessage(from, { text: "🔑 *Key de DeepSeek actualizada y guardada.*\n\nEl bot responderá con IA ahora. Envíe *ia* para confirmar el estado o *saldo* para ver el saldo." });
+                }
+                if (text === 'saldo' || text === 'saldo ia' || text === 'saldo deeepseek' || text === 'ia saldo') {
+                    const saldo = await ia.verificarSaldo();
+                    if (saldo === null) {
+                        return await safeSendMessage(from, { text: `🤖 IA DeepSeek: ${ia.estaHabilitada() ? '🟢 Activa' : '🔴 Desactivada'}.\n\nNo pude consultar el saldo. Verifique que DEEPSEEK_API_KEY esté configurada en Render.` });
+                    }
+                    return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n💵 Saldo disponible: *$${saldo.saldo.toFixed(2)} USD*\n${saldo.disponible ? '🟢 La IA puede responder.' : '🔴 Saldo agotado: el bot responde en modo clásico.'}` });
+                }
+            }
+
             // --- 0. BIENVENIDA PRIMERA VEZ + SALUDO ---
             if (!sesion) {
                 // Si es lista de precios/catálogo, agradecer en lugar de bienvenida
@@ -3135,26 +3166,6 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                 if (text === 'dolar' || text === 'bcv' || text === 'paralelo' ) {
                     await actualizarDolar();
                     return await safeSendMessage(from, { text: `💵 BCV: ${dolarInfo.bcv}\n📈 Paralelo: ${dolarInfo.paralelo}` });
-                }
-
-                if (text === 'saldo' || text === 'saldo ia' || text === 'saldo deeepseek' || text === 'ia saldo') {
-                    const saldo = await ia.verificarSaldo();
-                    if (saldo === null) {
-                        return await safeSendMessage(from, { text: `🤖 IA DeepSeek: ${ia.estaHabilitada() ? '🟢 Activa' : '🔴 Desactivada'}.\n\nNo pude consultar el saldo. Verifique que DEEPSEEK_API_KEY esté configurada en Render.` });
-                    }
-                    return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n💵 Saldo disponible: *$${saldo.saldo.toFixed(2)} USD*\n${saldo.disponible ? '🟢 La IA puede responder.' : '🔴 Saldo agotado: el bot responde en modo clásico.'}` });
-                }
-
-                if (text === 'ia on') {
-                    ia.forzarEstado(true);
-                    return await safeSendMessage(from, { text: "🤖 IA DeepSeek *activada*. Responderá con deepseek-chat mientras haya saldo." });
-                }
-                if (text === 'ia off') {
-                    ia.forzarEstado(false);
-                    return await safeSendMessage(from, { text: "🤖 IA DeepSeek *desactivada*. El bot vuelve al modo clásico." });
-                }
-                if (text === 'ia' || text === 'estado ia') {
-                    return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n${ia.estaHabilitada() ? '🟢 Activa (respondiendo con deepseek-chat)' : '🔴 Desactivada o en espera (bot clásico)'}` });
                 }
             }
 
