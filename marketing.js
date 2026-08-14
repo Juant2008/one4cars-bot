@@ -1,10 +1,10 @@
 const mysql = require('mysql2/promise');
 
 const dbConfig = {
-    host: 'one4cars.com',
-    user: 'juant200_one4car',
-    password: 'Notieneclave1*',
-    database: 'juant200_venezon'
+    host: process.env.DB_HOST || 'one4cars.com',
+    user: process.env.DB_USER || 'juant200_one4car',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'juant200_venezon'
 };
 
 // Obtener lista de vendedores para el filtro

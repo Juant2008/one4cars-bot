@@ -28,14 +28,15 @@ const ia = require('./deepseek');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
+const PDF_URL_CATALOGO = process.env.PDF_URL_CATALOGO || 'https://www.one4cars.com/catalogo.pdf';
 
 // LISTA DE ADMINISTRADORES
 const ADMIN_IDS = ["228621243408492", "97899534934200"];   
 const pool = mysql.createPool({
-    host: 'one4cars.com',
-    user: 'juant200_one4car',
-    password: 'Notieneclave1*',
-    database: 'juant200_venezon',
+    host: process.env.DB_HOST || 'one4cars.com',
+    user: process.env.DB_USER || 'juant200_one4car',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'juant200_venezon',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
