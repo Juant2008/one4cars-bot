@@ -1154,6 +1154,17 @@ async function initDB() {
             UNIQUE KEY uk_visita_cliente_semana (id_cliente, semana_inicio)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
 
+        await pool.execute(`CREATE TABLE IF NOT EXISTS bot_config (
+            clave VARCHAR(80) PRIMARY KEY,
+            valor MEDIUMTEXT,
+            actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
+        try { await poolLocal.execute(`CREATE TABLE IF NOT EXISTS bot_config (
+            clave VARCHAR(80) PRIMARY KEY,
+            valor MEDIUMTEXT,
+            actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`); } catch (e) {}
+
         await pool.execute(`CREATE TABLE IF NOT EXISTS tab_visitas (
             id_visita INT AUTO_INCREMENT PRIMARY KEY,
             fecha_reg DATE NOT NULL,
@@ -1570,6 +1581,7 @@ async function obtenerDetalleFacturas(id_cliente, id_vendedor = null) {
 }
 
 async function actualizarDolar() {
+    if (!proceActivo('dolar')) return;
     try {
         const resOficial = await axios.get('https://ve.dolarapi.com/v1/dolares/oficial', { timeout: 7000 });
         if (resOficial.data) dolarInfo.bcv = parseFloat(resOficial.data.promedio).toFixed(2);
@@ -1601,6 +1613,10 @@ async function marcarFacturasViejasComoNotificadas() {
 
 async function checkNuevasFacturas() {
     if (!isBotReady() || notificadorEjecutando) return;
+    if (!proceActivo('notificador')) {
+        notificadorEjecutando = false;
+        return;
+    }
     notificadorEjecutando = true;
     try {
         const [facturas] = await pool.execute(
@@ -1675,6 +1691,7 @@ function obtenerTonoMensaje(nivel, f, monto, fecha, dias) {
 
 async function checkFacturasVencidas() {
     if (!isBotReady() || recordatorioEjecutando) return;
+    if (!proceActivo('recordatorio')) return;
     if (primerEjecucionRecordatorio) {
         primerEjecucionRecordatorio = false;
         console.log("[RECORDATORIO] Primera ejecución omitida (startup guard).");
@@ -1731,6 +1748,7 @@ let primerEjecucionVendedor = true;
 
 async function checkVendedoresRecordatorio(force = false) {
     if (!isBotReady() || vendedorEjecutando) return;
+    if (!proceActivo('cobranza') && !force) return;
     if (!force && primerEjecucionVendedor) {
         primerEjecucionVendedor = false;
         console.log("[VENDEDORES] Primera ejecución omitida (startup guard).");
@@ -1806,6 +1824,10 @@ let primerEjecucionEstadisticas = true;
 async function checkEstadisticasVendedores(force = false) {
     if (!isBotReady()) {
         console.log("[ESTADISTICAS] Bot no está listo para enviar estadísticas.");
+        return;
+    }
+    if (!proceActivo('estadisticas') && !force) {
+        estadisticasEjecutando = false;
         return;
     }
     if (!force && primerEjecucionEstadisticas) {
@@ -2016,6 +2038,56 @@ async function checkEstadisticasVendedores(force = false) {
 // ===== CONFIGURACIÓN DE ENVÍOS =====
 const SEND_DEFAULTS = { batchSize: 10, pauseSend: 30000, pauseBatch: 600000 };
 let sendConfig = { ...SEND_DEFAULTS };
+
+// ===== ENTRENAMIENTO DEL BOT Y CONTROL DE PROCESOS (persistente en BD) =====
+const PROCESOS_DISPO = [
+    { id: 'ia',            icono: '🤖', nombre: 'IA DeepSeek (RODI)', desc: 'Responde consultas con IA cuando no hay intención clásica.' },
+    { id: 'notificador',   icono: '🧾', nombre: 'Notificador de facturas', desc: 'Envía aviso de nueva factura a clientes y vendedores (c/3 min).' },
+    { id: 'recordatorio',  icono: '⏰', nombre: 'Recordatorio deudas', desc: 'Recordatorios de facturas vencidas a clientes (c/24 h).' },
+    { id: 'cobranza',      icono: '💰', nombre: 'Cobranza vendedores', desc: 'Recordatorio de cobranza a vendedores (c/24 h).' },
+    { id: 'estadisticas',  icono: '📊', nombre: 'Estadísticas de ventas', desc: 'Reporte semanal de ventas a cada vendedor.' },
+    { id: 'dolar',         icono: '🪙', nombre: 'Actualización del dólar', desc: 'Refresca las tasas BCV y paralelo (c/1 h).' }
+];
+let procesosEstado = {};
+async function cargarConfigBD() {
+    try {
+        const [rows] = await pool.execute("SELECT clave, valor FROM bot_config");
+        for (const r of rows) {
+            if (r.clave === 'procesos' && r.valor) {
+                try { procesosEstado = JSON.parse(r.valor); } catch (e) {}
+            } else if ((r.clave === 'instrucciones' || r.clave === 'instrucciones.txt') && r.valor) {
+                ia.guardarInstrucciones(r.valor, false);
+            }
+        }
+        for (const p of PROCESOS_DISPO) {
+            if (typeof procesosEstado[p.id] !== 'boolean') procesosEstado[p.id] = true;
+        }
+        console.log("[CONFIG] Procesos cargados desde BD:", JSON.stringify(procesosEstado));
+    } catch (e) {
+        console.log("[CONFIG] Error cargando config BD:", e.message);
+        for (const p of PROCESOS_DISPO) procesosEstado[p.id] = true;
+    }
+}
+function proceActivo(id) {
+    return procesosEstado[id] !== false;
+}
+async function guardarConfigBD() {
+    try {
+        const valor = JSON.stringify(procesosEstado);
+        await pool.execute(
+            "INSERT INTO bot_config (clave, valor) VALUES ('procesos', ?) ON DUPLICATE KEY UPDATE valor = ?",
+            [valor, valor]
+        );
+    } catch (e) { console.log("[CONFIG] Error guardando procesos en BD:", e.message); }
+}
+async function guardarInstruccionesBD(texto) {
+    try {
+        await pool.execute(
+            "INSERT INTO bot_config (clave, valor) VALUES ('instrucciones', ?) ON DUPLICATE KEY UPDATE valor = ?",
+            [texto, texto]
+        );
+    } catch (e) { console.log("[CONFIG] Error guardando instrucciones en BD:", e.message); }
+}
 
 // ===== BOT WHATSAPP =====
 async function startBot() {
@@ -3315,7 +3387,10 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
             // Usa la IA con el saldo de DeepSeek. Si el saldo se agota o la key falla,
             // ia.preguntar devuelve null y el bot cae automáticamente al modo clásico.
             const nombreIA = nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || "Usuario";
-            const respIA = await ia.preguntar(rawText, dolarInfo);
+            let respIA = null;
+            if (proceActivo('ia')) {
+                respIA = await ia.preguntar(rawText, dolarInfo);
+            }
             if (respIA) {
                 await guardarMensaje(from, 'model', respIA);
                 lastFallbackSent.set(from, ahora);
@@ -4267,6 +4342,141 @@ const server = http.createServer(async (req, res) => {
             const [rows] = await pool.execute("SELECT a.id_agenda, a.fecha, a.estado, a.observacion FROM tab_agenda_visitas a WHERE a.id_cliente = ? ORDER BY a.fecha DESC LIMIT 20", [idCliente]);
             res.end(JSON.stringify(rows));
         } catch (e) { res.end(JSON.stringify([])); }
+    } else if (routename === '/ping') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: true,
+            bot: isBotReady() ? 'online' : 'offline',
+            ia: ia.estaHabilitada() ? 'activa' : 'desactivada',
+            procesos: procesosEstado,
+            hora: new Date().toISOString()
+        }));
+    } else if (routename === '/entrenar' && req.method === 'POST') {
+        let b = '';
+        req.on('data', c => b += c);
+        req.on('end', async () => {
+            try {
+                const params = new URLSearchParams(b);
+                const texto = params.get('instrucciones') || '';
+                if (texto.trim() === '') { res.writeHead(302, { Location: '/entrenar?action=error' }); return res.end(); }
+                ia.guardarInstrucciones(texto);
+                await guardarInstruccionesBD(texto);
+                res.writeHead(302, { Location: '/entrenar?action=guardado' });
+                res.end();
+            } catch (e) {
+                console.log("[ENTRENAR] Error guardando:", e.message);
+                res.writeHead(302, { Location: '/entrenar?action=error' });
+                res.end();
+            }
+        });
+    } else if (routename === '/entrenar') {
+        let accion = query.action || '';
+        const instruccionesActual = ia.textoInstrucciones();
+        const procesosRows = PROCESOS_DISPO.map(p => {
+            const activo = proceActivo(p.id);
+            const badge = activo
+                ? '<span class="badge bg-success" style="border-radius:20px;font-size:0.68rem">🟢 Encendido</span>'
+                : '<span class="badge bg-danger" style="border-radius:20px;font-size:0.68rem">🔴 Apagado</span>';
+            return `<div class="d-flex align-items-center justify-content-between p-2 border-bottom" style="border-color:rgba(255,255,255,0.08)!important">
+                <div>
+                    <div class="fw-bold" style="font-size:.9rem">${p.icono} ${p.nombre}</div>
+                    <small class="text-white-50" style="font-size:.75rem">${p.desc}</small>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    ${badge}
+                    <button class="btn btn-sm ${activo ? 'btn-outline-danger' : 'btn-outline-success'}" style="border-radius:10px" onclick="toggleProc('${p.id}')">${activo ? 'Apagar' : 'Encender'}</button>
+                </div>
+            </div>`;
+        }).join('');
+        const linkDeploy = 'https://dashboard.render.com/web/srv-d9v94m3l550s7381avog';
+        const linkCron = 'https://console.cron-job.org/jobs';
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<title>Entrenamiento del Bot IA</title>
+<style>
+body{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;font-family:'Segoe UI',system-ui,sans-serif;color:#fff}
+.card-dash{background:rgba(255,255,255,0.06);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.1);border-radius:20px;color:#fff}
+.txt-ia{background:rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.15);color:#e6e6e6;border-radius:12px;font-family:consolas,monospace;font-size:.82rem;line-height:1.5}
+.txt-ia:focus{outline:none;border-color:#7b6cff;box-shadow:0 0 0 3px rgba(123,108,255,.25)}
+.btn-acc{background:linear-gradient(135deg,#4f8cff,#7b6cff);border:0;border-radius:12px;font-weight:700}
+.btn-acc:hover{filter:brightness(1.1)}
+.link-ext{color:#9db4ff;text-decoration:none;font-size:.82rem}
+.link-ext:hover{color:#fff;text-decoration:underline}
+</style></head>
+<body>
+${header}
+<div class="container pb-4">
+<div class="row g-3 mb-3">
+<div class="col-md-4"><a href="${linkDeploy}" target="_blank" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
+<div class="fw-bold mb-1"><i class="bi bi-rocket-takeoff me-1"></i> Render (Deploy)</div>
+<small class="link-ext">dashboard.render.com/web/srv-d9v94m3l550s7381avog</small></a></div>
+<div class="col-md-4"><a href="${linkCron}" target="_blank" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
+<div class="fw-bold mb-1"><i class="bi bi-clock-history me-1"></i> cron-job.org (Conexión)</div>
+<small class="link-ext">console.cron-job.org/jobs</small></a></div>
+<div class="col-md-4"><div class="card-dash p-3 h-100">
+<div class="fw-bold mb-1"><i class="bi bi-cpu me-1"></i> Estado del Bot</div>
+${isBotReady() ? '<span class="badge bg-success" style="border-radius:20px">🟢 Online</span>' : '<span class="badge bg-danger" style="border-radius:20px">🔴 Offline</span>'}
+<span class="ms-2 text-white-50 small">IA: ${ia.estaHabilitada() ? '🟢' : '🔴'}</span>
+<button class="btn btn-sm btn-outline-light ms-2" style="border-radius:10px" onclick="location.href='/ping'">Ver /ping</button>
+</div></div></div>
+${accion === 'guardado' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Entrenamiento del bot guardado. La IA lo usará inmediatamente.</div>' : ''}
+${accion === 'seguir' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Proceso actualizado.</div>' : ''}
+${accion === 'error' ? '<div class="alert alert-danger py-2" style="border-radius:12px">❌ Hubo un error, revisa la consola del bot.</div>' : ''}
+<div class="row g-3">
+<div class="col-lg-7">
+<div class="card-dash p-4">
+<h5 class="mb-1"><i class="bi bi-robot me-2"></i>Entrenar al Bot (instrucciones.txt)</h5>
+<p class="text-white-50 small mb-3">El sistema reemplaza ${'${fecha}'} y las tasas de dólar automáticamente.</p>
+<form method="POST" action="/entrenar">
+<textarea class="form-control txt-ia mb-3" name="instrucciones" rows="22">${instruccionesActual.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea>
+<div class="d-flex gap-2 flex-wrap">
+<button class="btn btn-acc px-4" type="submit"><i class="bi bi-save me-1"></i>Guardar Entrenamiento</button>
+<a class="btn btn-outline-light" style="border-radius:12px" href="/">Volver al Admin</a>
+</div>
+</form>
+</div>
+</div>
+<div class="col-lg-5">
+<div class="card-dash p-4">
+<h5 class="mb-2"><i class="bi bi-toggle-on me-2"></i>Procesos del Bot</h5>
+<p class="text-white-50 small mb-2">Enciende o apaga cada proceso. El estado se guarda en la BD.</p>
+${procesosRows}
+</div>
+</div>
+</div>
+</div>
+<script>
+async function toggleProc(id){
+    if(!confirm('¿Cambiar el estado del proceso?'))return;
+    const r=await fetch('/procesos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+    const t=await r.text();
+    location.href='/entrenar?action='+(t==='OK'?'seguir':'error');
+}
+</script>
+</body></html>`);
+    } else if (routename === '/procesos' && req.method === 'POST') {
+        let b = '';
+        req.on('data', c => b += c);
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(b);
+                if (data && data.id && PROCESOS_DISPO.some(p => p.id === data.id)) {
+                    procesosEstado[data.id] = !procesosEstado[data.id];
+                    if (typeof procesosEstado[data.id] !== 'boolean') procesosEstado[data.id] = true;
+                    if (data.id === 'ia') {
+                        if (procesosEstado.ia) ia.forzarEstado(true);
+                        else ia.forzarEstado(procesosEstado.ia);
+                    }
+                    await guardarConfigBD();
+                    res.end("OK");
+                } else {
+                    res.end("ERROR");
+                }
+            } catch (e) { res.end("ERROR"); }
+        });
     } else {
         const [zonas] = await pool.execute("SELECT DISTINCT zona FROM tab_clientes WHERE zona != '' AND zona IS NOT NULL ORDER BY zona");
         const zonaOptsMain = zonas.map(z => `<option value="${z.zona}">${z.zona}</option>`).join('');
@@ -4554,6 +4764,7 @@ document.querySelectorAll('#frecSel, #zonaSel, #fechaSel').forEach(el => {
 
 server.listen(PORT, '0.0.0.0', async () => {
     await initDB();
+    await cargarConfigBD();
     await restaurarSesiones();
     startBot();
     actualizarDolar();

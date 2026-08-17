@@ -29,6 +29,7 @@ function persistirKey(key) {
 const MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
 const API_URL = 'https://api.deepseek.com/chat/completions';
 const BALANCE_URL = 'https://api.deepseek.com/user/balance';
+const INSTRUCCIONES_FILE = path.join(__dirname, 'instrucciones.txt');
 
 // Estado interno de la IA
 let iaHabilitada = API_KEY.length > 0;      // Si no hay key, nunca usamos IA
@@ -47,6 +48,32 @@ function cargarPrompt() {
     } catch (e) {}
     if (!promptCache) promptCache = '';
     return promptCache;
+}
+
+// Recarga el prompt desde el archivo (para que el admin vea/edite el texto actual)
+function textoInstrucciones() {
+    const t = cargarPrompt();
+    return typeof t === 'string' ? t : '';
+}
+
+// Sobrescribe instrucciones.txt y limpia el cache para que la IA use el nuevo texto
+function guardarInstrucciones(texto, persistirDisco) {
+    const nuevo = String(texto || '').replace(/\r\n/g, '\n');
+    promptCache = nuevo;
+    if (persistirDisco !== false) {
+        try {
+            fs.writeFileSync(INSTRUCCIONES_FILE, nuevo, 'utf8');
+        } catch (e) {
+            console.log('[IA] No se pudo guardar instrucciones.txt:', e.message);
+        }
+    }
+    return nuevo;
+}
+
+// Refresca el cache leyendo el archivo de nuevo (tras editarlo por otro medio)
+function recargarInstrucciones() {
+    promptCache = null;
+    return cargarPrompt();
 }
 
 // Construye el system prompt con datos en tiempo real (fecha y dólar)
@@ -156,4 +183,4 @@ function forzarEstado(habil) {
     cooldownHasta = 0;
 }
 
-module.exports = { preguntar, verificarSaldo, estaHabilitada, setKey, forzarEstado };
+module.exports = { preguntar, verificarSaldo, estaHabilitada, setKey, forzarEstado, textoInstrucciones, guardarInstrucciones, recargarInstrucciones };
