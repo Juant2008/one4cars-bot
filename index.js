@@ -4571,6 +4571,20 @@ ${hoyVis.length > 0 ? `
 </div>
 <div class="row g-3">
 <div class="col-6 col-sm-4 col-md-3">
+<a href="/entrenar" class="text-decoration-none">
+<div class="card-dash h-100" style="background:rgba(123,108,255,0.18);border-color:rgba(123,108,255,0.45)">
+<div class="card-body">
+<div class="d-flex align-items-center gap-3 mb-2">
+<div class="icon-box" style="background:rgba(123,108,255,0.25);color:#b3a6ff"><i class="bi bi-robot"></i></div>
+<small class="text-white-50 text-uppercase" style="font-size:0.65rem;letter-spacing:0.5px">IA / Entrenamiento</small>
+</div>
+<span class="fw-bold" style="font-size:0.95rem">Entrenar al Bot</span>
+<span class="d-block mt-1" style="font-size:0.7rem;color:#b3a6ff">instrucciones + procesos on/off</span>
+</div>
+</div>
+</a>
+</div>
+<div class="col-6 col-sm-4 col-md-3">
 <a href="/cobranza" class="text-decoration-none">
 <div class="card-dash h-100">
 <div class="card-body">
