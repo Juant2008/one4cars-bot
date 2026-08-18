@@ -83,7 +83,8 @@ function construirPrompt(dolarInfo) {
     return base
         .replace(/\$\{fecha\}/g, fecha)
         .replace(/\$\{txtOficial\}/g, (dolarInfo && dolarInfo.bcv) || 'Cargando...')
-        .replace(/\$\{txtParalelo\}/g, (dolarInfo && dolarInfo.paralelo) || 'Cargando...');
+        .replace(/\$\{txtParalelo\}/g, (dolarInfo && dolarInfo.paralelo) || 'Cargando...')
+        .replace(/\$\{txtBinance\}/g, (dolarInfo && dolarInfo.binance) || 'Cargando...');
 }
 
 // Verifica saldo restante en DeepSeek
@@ -161,6 +162,44 @@ async function preguntar(mensaje, dolarInfo) {
     }
 }
 
+// Clasifica la intención del mensaje usando la IA (barato: max_tokens pequeño).
+// Devuelve una de: monto_pagar, estado_cuenta, lista_precios, tomar_pedido, medios_pago,
+// mis_clientes, afiliar, consulta_productos, despacho, asesor, visita, saludar, otro.
+const INTENTOS_VALIDOS = ['monto_pagar','estado_cuenta','lista_precios','tomar_pedido','medios_pago','mis_clientes','afiliar','consulta_productos','despacho','asesor','visita','saludar','otro'];
+async function clasificar(mensaje) {
+    if (!iaHabilitada || !API_KEY) return 'otro';
+    if (Date.now() < cooldownHasta) return 'otro';
+    try {
+        const resp = await axios.post(API_URL, {
+            model: MODEL,
+            messages: [
+                { role: 'system', content: 'Clasifica la intención del mensaje de WhatsApp recibido por una autopartes venezolana que vende al mayor. RESPONDE SOLO con una sola palabra en minúsculas, sin signos de puntuación, eligiendo entre: monto_pagar, estado_cuenta, lista_precios, tomar_pedido, medios_pago, mis_clientes, afiliar, consulta_productos, despacho, asesor, visita, saludar, otro. Reglas: monto_pagar = preguntar cuánto debe/pagar, monto de una factura, saldo de la factura, cuánto pagar de un cliente, deuda de un cliente. estado_cuenta = consultar el estado general de la cuenta o facturas pendientes. consulta_productos = preguntar por piezas/repuestos/stock/precio de un producto. lista_precios = pedir la lista/catálogo de precios. tomar_pedido = querer comprar/hacer un pedido. despacho = saber dónde está su pedido/envío. asesor = pedir hablar con una persona. Si no hay seguridad, responde otro.' },
+                { role: 'user', content: String(mensaje).substring(0, 500) }
+            ],
+            max_tokens: 8,
+            temperature: 0
+        }, {
+            headers: {
+                'Authorization': `Bearer ${API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 20000
+        });
+        const t = resp.data && resp.data.choices && resp.data.choices[0]
+            && resp.data.choices[0].message && resp.data.choices[0].message.content;
+        if (!t) return 'otro';
+        const m = t.trim().toLowerCase();
+        return INTENTOS_VALIDOS.includes(m) ? m : 'otro';
+    } catch (e) {
+        const status = e.response && e.response.status;
+        if (ERRORES_SALDO.includes(status)) {
+            iaHabilitada = false;
+            console.log('[IA] 🔴 Clasificador: saldo/key inválida. Modo clásico.');
+        }
+        return 'otro';
+    }
+}
+
 function estaHabilitada() {
     return iaHabilitada && Date.now() >= cooldownHasta;
 }
@@ -183,4 +222,4 @@ function forzarEstado(habil) {
     cooldownHasta = 0;
 }
 
-module.exports = { preguntar, verificarSaldo, estaHabilitada, setKey, forzarEstado, textoInstrucciones, guardarInstrucciones, recargarInstrucciones };
+module.exports = { preguntar, clasificar, verificarSaldo, estaHabilitada, setKey, forzarEstado, textoInstrucciones, guardarInstrucciones, recargarInstrucciones };

@@ -236,13 +236,14 @@ const MENU_INTENTIONS = {
 let qrCodeData = "Iniciando...";
 let socketBot = null;
 let botStarting = false; // Mutex para evitar llamadas concurrentes a startBot()
-let dolarInfo = { bcv: 'Cargando...', paralelo: 'Cargando...' };
+let dolarInfo = { bcv: 'Cargando...', paralelo: 'Cargando...', binance: 'Cargando...' };
 let notificadorInterval = null;
 const pendientesConfirmacion = new Map();
 const carritoCompras = new Map();
 const agendaVisitas = new Map();
 const pendingProductSelection = new Map();
 const multiItemOrders = new Map();
+const pendienteFactura = new Map();
 const lastFallbackSent = new Map();
 const FALLBACK_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutos
 const lastMessageTimes = new Map(); // Evitar respuestas duplicadas
@@ -327,6 +328,7 @@ const PRODUCT_KEYWORDS = [
     'volante', 'volantes', 'bocina', 'bocinas', 'claxon',
     'llanta', 'llantas', 'rin', 'rines', 'tapa', 'tapas',
     'suspension', 'suspensión', 'barra', 'barras', 'estabilizador',
+    'cruceta', 'crucetas', 'muñon', 'muñones', 'uniones de estopera', 'munon', 'munones', 'lapiz de barra', 'lápiz de barra', 'barra estabilizadora',
     'rotula', 'rotulas', 'axial', 'terminal', 'terminales',
     'caja', 'direccion', 'cremallera', 'cardan', 'cardanes',
     'embrague', 'clutch', 'presion', 'presión', 'plato', 'platos',
@@ -511,7 +513,7 @@ async function guardarMensaje(tel, rol, contenido) {
 async function setModo(tel, modo) {
     await pool.execute("INSERT INTO control_chat (telefono, modo, updated_at) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE modo = VALUES(modo), updated_at = NOW()", [tel, modo]);
 }
-const REACTIVAR_BOT_MS = 2 * 60 * 60 * 1000; // 2 horas sin actividad humana → el bot se reactiva solo
+const REACTIVAR_BOT_MS = 5 * 60 * 1000; // 5 minutos sin que el humano intervenga → el bot se reactiva solo
 
 async function setSesionDatos(tel, datos) {
     try {
@@ -1299,9 +1301,16 @@ async function guardarUsuario(jid, usuario, id_int) {
 
 async function buscarCliente(rifLimpio) {
     const soloNum = soloNumerosRIF(rifLimpio);
+    if (!soloNum) return null;
+    const numEntero = parseInt(soloNum, 10) || 0;
     const [r] = await pool.execute(
-        "SELECT id_cliente, nombres, celular, cedula, direccion, zona FROM tab_clientes WHERE clave = ? OR clave = ? OR clave LIKE ? LIMIT 1", 
-        [rifLimpio, soloNum, `%${rifLimpio}%`]
+        `SELECT id_cliente, nombres, celular, cedula, direccion, zona, TRIM(clave) as rif FROM tab_clientes
+         WHERE TRIM(clave) = ?
+            OR CAST(REPLACE(TRIM(clave), ' ', '') AS UNSIGNED) = ?
+            OR REPLACE(TRIM(clave), ' ', '') LIKE ?
+         ORDER BY (TRIM(clave) = ?) DESC
+         LIMIT 1`,
+        [soloNum, numEntero, `%${soloNum}%`, soloNum]
     );
     return r[0] || null;
 }
@@ -1580,6 +1589,71 @@ async function obtenerDetalleFacturas(id_cliente, id_vendedor = null) {
     return facturas;
 }
 
+// Pide el RIF del cliente (con o sin letra) y guarda el estado de la consulta.
+async function iniciarConsultaFactura(from, pushName) {
+    pendienteFactura.set(from, { paso: 'rif' });
+    const nombre = pushName || 'Estimado/a';
+    return await safeSendMessage(from, { text: `🔎 *${nombre}*, para mostrarle el *monto a pagar* de las facturas de un cliente necesito su *RIF*.\n\n📌 Puede enviarlo con o sin la letra, por ejemplo: *J-123456789* o simplemente *123456789*.\n\n_Escriba *cancelar* para salir._` });
+}
+
+// Procesa la respuesta del RIF y lista las facturas pendientes numeradas.
+async function procesarRIFConsulta(from, rawText, text) {
+    const estado = pendienteFactura.get(from);
+    if (!estado) return null;
+    const cancelWords = ['cancelar', 'cancela', 'salir', 'no', 'nada'];
+    if (cancelWords.includes(text)) {
+        pendienteFactura.delete(from);
+        await safeSendMessage(from, { text: "❌ Consulta de facturas cancelada." });
+        return true;
+    }
+    if (estado.paso === 'rif') {
+        const rifLimpio = limpiarRIF(rawText);
+        if (!rifLimpio || rifLimpio.length < 6) {
+            await safeSendMessage(from, { text: "❌ Ese RIF no parece válido. Envíe el RIF del cliente (ej: *J-123456789*) o *cancelar*." });
+            return true;
+        }
+        const c = await buscarCliente(rifLimpio);
+        if (!c) {
+            await safeSendMessage(from, { text: `❌ No encontré ningún cliente con el RIF *${rifLimpio}*.\n\nVerifique e intente de nuevo, o escriba *cancelar*.` });
+            return true;
+        }
+        const facturas = await obtenerDetalleFacturas(c.id_cliente);
+        if (facturas.length === 0) {
+            pendienteFactura.delete(from);
+            await safeSendMessage(from, { text: `✅ El cliente *${c.nombres}* no tiene facturas pendientes por pagar.` });
+            return true;
+        }
+        let listado = `⭐ *FACTURAS PENDIENTES*\nCliente: *${c.nombres}*\nRIF: ${rifLimpio}\n\n`;
+        facturas.forEach((f, i) => {
+            const monto = (f.total - f.abono_factura) / (f.porcentaje || 1);
+            listado += `*${i + 1}.* *#${f.nro_factura}* | *$${monto.toFixed(2)}*\n`;
+        });
+        listado += `\n📌 Responda el *número* de la factura para ver el monto a pagar y la factura firmada.`;
+        pendienteFactura.set(from, { paso: 'elegir', cliente: c, facturas });
+        await safeSendMessage(from, { text: listado });
+        return true;
+    }
+    if (estado.paso === 'elegir') {
+        if (!/^\d+$/.test(text)) {
+            await safeSendMessage(from, { text: "❌ Responda el *número* de la factura o escriba *cancelar*." });
+            return true;
+        }
+        const idx = parseInt(text, 10) - 1;
+        if (idx < 0 || idx >= estado.facturas.length) {
+            await safeSendMessage(from, { text: "❌ Número inválido. Elija un número de la lista o escriba *cancelar*." });
+            return true;
+        }
+        const f = estado.facturas[idx];
+        const monto = (f.total - f.abono_factura) / (f.porcentaje || 1);
+        const fReg = new Date(f.fecha_reg).toISOString().split('T')[0];
+        const params = `id_factura=${f.id_factura}&nro_factura=${f.nro_factura}&fecha_reg=${fReg}&total=${f.total}&abono_factura=${f.abono_factura}&nombres=${encodeURIComponent((f.nombres||'').trim())}&nombre=${encodeURIComponent((f.nombre_vendedor||'').trim())}&direccion=${encodeURIComponent((f.direccion||'').trim())}&cedula=${(f.cedula||'').trim()}&celular=${encodeURIComponent((f.celular||'').trim())}&telefono=${encodeURIComponent((f.telefono||'').trim())}&id_cliente=${f.id_cliente}&zona=${encodeURIComponent((f.zona||'').trim())}&descuento=${f.descuento}&total_desc=${f.total_desc}`;
+        pendienteFactura.delete(from);
+        await safeSendMessage(from, { text: `📄 *Factura #${f.nro_factura}*\n\n💰 *Monto a pagar: $${monto.toFixed(2)}*\n📅 Fecha: ${fReg}\n\n✍️ *Factura firmada:*\nhttps://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg\n\n📄 *Reporte completo:*\nhttps://one4cars.com/sevencorp/factura_full_reporte_web.php?${params}` });
+        return true;
+    }
+    return null;
+}
+
 async function actualizarDolar() {
     if (!proceActivo('dolar')) return;
     try {
@@ -1588,6 +1662,17 @@ async function actualizarDolar() {
         const resParalelo = await axios.get('https://ve.dolarapi.com/v1/dolares/paralelo', { timeout: 7000 });
         if (resParalelo.data) dolarInfo.paralelo = parseFloat(resParalelo.data.promedio).toFixed(2);
     } catch (e) { console.log("Error Dolar API"); }
+    try {
+        const binanceResp = await axios.post('https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search',
+            { asset: 'USDT', fiat: 'VES', tradeType: 'BUY', page: 1, rows: 3, payTypes: [] },
+            { headers: { 'Content-Type': 'application/json;charset=utf-8', 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }, timeout: 7000 });
+        const ads = binanceResp.data && binanceResp.data.data;
+        if (Array.isArray(ads) && ads.length > 0) {
+            let mejor = Infinity;
+            for (const a of ads) { const p = parseFloat(a.adv && a.adv.price); if (!isNaN(p) && p < mejor) mejor = p; }
+            if (mejor < Infinity) dolarInfo.binance = mejor.toFixed(2);
+        }
+    } catch (e) { console.log("Error Dolar Binance P2P"); }
 }
 
 // ===== NOTIFICADOR DE FACTURAS NUEVAS =====
@@ -2046,7 +2131,7 @@ const PROCESOS_DISPO = [
     { id: 'recordatorio',  icono: '⏰', nombre: 'Recordatorio deudas', desc: 'Recordatorios de facturas vencidas a clientes (c/24 h).' },
     { id: 'cobranza',      icono: '💰', nombre: 'Cobranza vendedores', desc: 'Recordatorio de cobranza a vendedores (c/24 h).' },
     { id: 'estadisticas',  icono: '📊', nombre: 'Estadísticas de ventas', desc: 'Reporte semanal de ventas a cada vendedor.' },
-    { id: 'dolar',         icono: '🪙', nombre: 'Actualización del dólar', desc: 'Refresca las tasas BCV y paralelo (c/1 h).' }
+    { id: 'dolar',         icono: '🪙', nombre: 'Actualización del dólar', desc: 'Refresca tasas BCV, paralelo y Binance P2P (c/1 h).' }
 ];
 let procesosEstado = {};
 async function cargarConfigBD() {
@@ -2420,6 +2505,12 @@ async function startBot() {
                 return;
             }
 
+            // --- 1. FLUJO PENDIENTE DE CONSULTA DE FACTURAS POR RIF (vendedores/usuarios) ---
+            if (pendienteFactura.has(from)) {
+                const manejado = await procesarRIFConsulta(from, rawText, text);
+                if (manejado) return;
+            }
+
             // --- 1. LÓGICA DE RIF (ADMINISTRADORES) ---
             if (esRIFPuro) {
                 if (isAdmin) {
@@ -2518,7 +2609,8 @@ async function startBot() {
                 if (menuOption.includes('Estado de cuenta')) {
                     const targetID = sesion?.id_cliente_int;
                     if (!targetID) {
-                        return await safeSendMessage(from, { text: "Para consultar su estado de cuenta, por favor envíe su *RIF* para identificarlo." });
+                        // Sin cliente identificado: pedir RIF (vendedor consultando un cliente, o cliente sin sesión)
+                        return await iniciarConsultaFactura(from, pushName);
                     }
                     const facturas = await obtenerDetalleFacturas(targetID);
                     if (facturas.length === 0) return await safeSendMessage(from, { text: "✅ No posee facturas pendientes." });
@@ -3340,9 +3432,9 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                     return await safeSendMessage(from, { text: `✍️ *Factura Firmada #${numNota}*\n\nPuede ver la imagen aquí:\n${linkNota}` });
                 }
 
-                if (text === 'dolar' || text === 'bcv' || text === 'paralelo' ) {
+                if (text === 'dolar' || text === 'bcv' || text === 'paralelo' || text === 'binance' ) {
                     await actualizarDolar();
-                    return await safeSendMessage(from, { text: `💵 BCV: ${dolarInfo.bcv}\n📈 Paralelo: ${dolarInfo.paralelo}` });
+                    return await safeSendMessage(from, { text: `💵 BCV: ${dolarInfo.bcv}\n📈 Paralelo: ${dolarInfo.paralelo}\n🪙 Binance (P2P): ${dolarInfo.binance}` });
                 }
             }
 
@@ -3388,6 +3480,21 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
             // ia.preguntar devuelve null y el bot cae automáticamente al modo clásico.
             const nombreIA = nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || "Usuario";
             let respIA = null;
+            // 9.1a DETECCIÓN DE INTENCIÓN: primero con IA (si está activa). Si devuelve 'otro' o la IA
+            // está desactivada/sin saldo, se usa un respaldo local de palabras clave para que el flujo
+            // de "monto a pagar / estado de cuenta por RIF" siga funcionando siempre.
+            let intentoIA = 'otro';
+            if (proceActivo('ia')) {
+                try { intentoIA = await ia.clasificar(rawText); } catch (e) { intentoIA = 'otro'; }
+            }
+            const regexIntencionMonto = /(monto\s+a\s+pagar|monto\s+de\s+la\s+factura|saldo\s+de\s+la\s+factura|cuanto\s+(pagar|debo|debe)|cuanto\s+(le|me)\s+(debo|toca|corresponde|queda)|cuanto\s+es\s+el\s+monto|deuda|deudo|adeudo|pagar\s+factura|estado\s+de\s+cuenta|estados?\s+de\s+cuenta|facturas?\s+pendientes|cuentas?\s+pendientes|balance\s+de\s+cuenta|me\s+toca\s+pagar|tengo\s+que\s+pagar|tengo\s+pendiente|saldar\s+factura)/i;
+            const esIntencionPago = intentoIA === 'monto_pagar' || intentoIA === 'estado_cuenta' || regexIntencionMonto.test(rawText) || (/(rif|cliente)\s*[jvegJ VEG]?\s*\d{6,}/i.test(rawText) && /(monto|pagar|deud|factura|cuent|saldo|pendiente|estado)/i.test(rawText));
+            if (esIntencionPago) {
+                // No delegar si el mensaje es un número (selección en curso) o ya está en otro flujo.
+                if (!pendienteFactura.has(from) && !/^\d+$/.test(text)) {
+                    return await iniciarConsultaFactura(from, pushName);
+                }
+            }
             if (proceActivo('ia')) {
                 respIA = await ia.preguntar(rawText, dolarInfo);
             }
@@ -4659,6 +4766,7 @@ body{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh
 <div class="d-flex align-items-center gap-2">
 <span class="dolar-badge text-white-50"><i class="bi bi-currency-dollar"></i> BCV ${dolarInfo.bcv}</span>
 <span class="dolar-badge text-white-50"><i class="bi bi-currency-exchange"></i> $ ${dolarInfo.paralelo}</span>
+<span class="dolar-badge text-white-50"><i class="bi bi-yin-yang"></i> B ${dolarInfo.binance}</span>
 <span class="badge ${qrCodeData === 'ONLINE ✅' ? 'bg-success' : 'bg-danger'}" style="border-radius:20px;font-size:0.7rem">
 ${qrCodeData === 'ONLINE ✅' ? '🟢 Online' : '🔴 Offline'}
 </span>

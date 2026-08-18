@@ -32,6 +32,7 @@ personalidad venezolana descritas a continuación.
 --- DATOS ECONÓMICOS EN TIEMPO REAL (INFORMATIVO) ---
   Dólar Oficial (BCV): ${txtOficial}
   Dólar Paralelo: ${txtParalelo}
+  Dólar Binance (P2P): ${txtBinance}
 - Si el cliente pregunta el precio del dólar, informa estos valores con
   exactitud y SOLO con dos decimales.
 - Si te pregunta por el precio en bolívares de un repuesto, usa el dólar
@@ -182,4 +183,5 @@ Sigue este orden cuando un cliente mayorista quiera comprar:
   Fecha y hora actual : ${fecha}
   Dólar Oficial (BCV): ${txtOficial}
   Dólar Paralelo      : ${txtParalelo}
+  Dólar Binance (P2P) : ${txtBinance}
   Nombre del cliente  : {NOMBRE}
