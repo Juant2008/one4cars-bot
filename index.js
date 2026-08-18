@@ -4384,6 +4384,7 @@ const server = http.createServer(async (req, res) => {
                 </div>
                 <div class="d-flex align-items-center gap-2">
                     ${badge}
+                    ${p.id !== 'ia' ? `<button class="btn btn-sm btn-outline-success" style="border-radius:10px" onclick="runProc('${p.id}')">▶ Ejecutar</button>` : ''}
                     <button class="btn btn-sm ${activo ? 'btn-outline-danger' : 'btn-outline-success'}" style="border-radius:10px" onclick="toggleProc('${p.id}')">${activo ? 'Apagar' : 'Encender'}</button>
                 </div>
             </div>`;
@@ -4416,6 +4417,9 @@ ${header}
 <div class="col-md-4"><a href="${linkCron}" target="_blank" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
 <div class="fw-bold mb-1"><i class="bi bi-clock-history me-1"></i> cron-job.org (Conexión)</div>
 <small class="link-ext">console.cron-job.org/jobs</small></a></div>
+<div class="col-md-4"><a href="/sql" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
+<div class="fw-bold mb-1"><i class="bi bi-database me-1"></i> Consultas SQL</div>
+<small class="link-ext">Explora las tablas y haz consultas de lectura</small></a></div>
 <div class="col-md-4"><div class="card-dash p-3 h-100">
 <div class="fw-bold mb-1"><i class="bi bi-cpu me-1"></i> Estado del Bot</div>
 ${isBotReady() ? '<span class="badge bg-success" style="border-radius:20px">🟢 Online</span>' : '<span class="badge bg-danger" style="border-radius:20px">🔴 Offline</span>'}
@@ -4424,6 +4428,8 @@ ${isBotReady() ? '<span class="badge bg-success" style="border-radius:20px">🟢
 </div></div></div>
 ${accion === 'guardado' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Entrenamiento del bot guardado. La IA lo usará inmediatamente.</div>' : ''}
 ${accion === 'seguir' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Proceso actualizado.</div>' : ''}
+${accion === 'runok' ? '<div class="alert alert-info py-2" style="border-radius:12px">▶ Proceso ejecutado. Revisa el dashboard/historial para ver resultados.</div>' : ''}
+${accion === 'botoff' ? '<div class="alert alert-warning py-2" style="border-radius:12px">⚠️ El bot de WhatsApp está offline; no se pudo ejecutar el proceso.</div>' : ''}
 ${accion === 'error' ? '<div class="alert alert-danger py-2" style="border-radius:12px">❌ Hubo un error, revisa la consola del bot.</div>' : ''}
 <div class="row g-3">
 <div class="col-lg-7">
@@ -4455,6 +4461,12 @@ async function toggleProc(id){
     const t=await r.text();
     location.href='/entrenar?action='+(t==='OK'?'seguir':'error');
 }
+async function runProc(id){
+    if(!confirm('¿Ejecutar ahora este proceso manualmente?'))return;
+    const r=await fetch('/procesos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,accion:'run'})});
+    const t=await r.text();
+    location.href='/entrenar?action='+(t==='OK'?'runok':(t==='BOT_OFFLINE'?'botoff':'error'));
+}
 </script>
 </body></html>`);
     } else if (routename === '/procesos' && req.method === 'POST') {
@@ -4463,7 +4475,26 @@ async function toggleProc(id){
         req.on('end', async () => {
             try {
                 const data = JSON.parse(b);
+                const accion = data.accion === 'run' ? 'run' : 'toggle';
                 if (data && data.id && PROCESOS_DISPO.some(p => p.id === data.id)) {
+                    if (accion === 'run') {
+                        const dis = {
+                            notificador: () => checkNuevasFacturas(),
+                            recordatorio: () => checkFacturasVencidas(),
+                            cobranza: () => checkVendedoresRecordatorio(true),
+                            estadisticas: () => checkEstadisticasVendedores(true),
+                            dolar: () => actualizarDolar()
+                        };
+                        const fn = dis[data.id];
+                        if (fn) {
+                            if (data.id !== 'dolar' && !isBotReady()) { res.end("BOT_OFFLINE"); return; }
+                            fn().catch(e => console.log("[PROCESOS] Error al ejecutar", data.id, e.message));
+                            res.end("OK");
+                        } else {
+                            res.end("ERROR");
+                        }
+                        return;
+                    }
                     procesosEstado[data.id] = !procesosEstado[data.id];
                     if (typeof procesosEstado[data.id] !== 'boolean') procesosEstado[data.id] = true;
                     if (data.id === 'ia') {
@@ -4477,6 +4508,109 @@ async function toggleProc(id){
                 }
             } catch (e) { res.end("ERROR"); }
         });
+    } else if (routename === '/sql') {
+        if (req.method === 'POST') {
+            let b = '';
+            req.on('data', c => b += c);
+            req.on('end', async () => {
+                let sql = '';
+                try { sql = (JSON.parse(b).sql || '').toString().trim().replace(/;\s*$/, ''); } catch (e) {}
+                if (!sql) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end(JSON.stringify({error:'Consulta vacía'})); }
+                const head = sql.split(/\s+/)[0].toUpperCase();
+                const permitidas = ['SELECT','SHOW','DESCRIBE','DESC','EXPLAIN','PRAGMA'];
+                if (!permitidas.includes(head) || /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|RENAME|GRANT|REVOKE)\b/i.test(sql)) {
+                    res.writeHead(403, {'Content-Type':'application/json'});
+                    return res.end(JSON.stringify({error:'Solo se permiten consultas de lectura (SELECT, SHOW, DESCRIBE, EXPLAIN).'}));
+                }
+                try {
+                    const [rows, fields] = await pool.query({ sql, timeout: 20000 });
+                    res.writeHead(200, {'Content-Type':'application/json'});
+                    res.end(JSON.stringify({filas: rows.length, campos: (fields||[]).map(f => f.name), rows: rows.slice(0, 200)}));
+                } catch (e) {
+                    res.writeHead(200, {'Content-Type':'application/json'});
+                    res.end(JSON.stringify({error: e.message}));
+                }
+            });
+        } else {
+            let tabsHtml = '';
+            try {
+                const [tabs] = await pool.query("SHOW TABLES");
+                tabsHtml = tabs.map(t => Object.values(t)[0])
+                    .map(t => `<option value="SELECT * FROM \`${t.replace(/`/g,'``')}\` LIMIT 20">${t}</option>`).join('');
+            } catch (e) {}
+            res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
+            res.end(`<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<title>Consultas SQL</title>
+<style>
+body{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;font-family:'Segoe UI',system-ui,sans-serif;color:#fff}
+.card-dash{background:rgba(255,255,255,0.06);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.1);border-radius:20px;color:#fff}
+.txt-sql{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.15);color:#8ff;border-radius:12px;font-family:consolas,monospace;font-size:.82rem}
+.txt-sql:focus{outline:none;border-color:#4f8cff;box-shadow:0 0 0 3px rgba(79,140,255,.25);color:#e6e6e6}
+.btn-acc{background:linear-gradient(135deg,#4f8cff,#7b6cff);border:0;border-radius:12px;font-weight:700}
+.btn-acc:hover{filter:brightness(1.1)}
+.tbl-r{width:100%;font-size:.74rem;overflow:auto;max-height:380px;display:block}
+.tbl-r table{width:100%;border-collapse:collapse}
+.tbl-r th{position:sticky;top:0;background:#3a3558;color:#cdd;padding:6px 8px;text-align:left;white-space:nowrap}
+.tbl-r td{padding:5px 8px;border-top:1px solid rgba(255,255,255,0.07);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip-sql{background:rgba(79,140,255,0.15);border:1px solid rgba(79,140,255,0.3);border-radius:10px;padding:2px 8px;font-size:.72rem;color:#a8c4ff;cursor:pointer}
+.chip-sql:hover{background:rgba(79,140,255,0.3)}
+</style></head>
+<body>
+${header}
+<div class="container pb-4">
+<div class="row g-3">
+<div class="col-lg-6">
+<div class="card-dash p-4">
+<h5 class="mb-1"><i class="bi bi-database me-2"></i>Consultas SQL (lectura)</h5>
+<p class="text-white-50 small mb-3">Solo SELECT / SHOW / DESCRIBE / EXPLAIN. Máx. 200 filas mostradas.</p>
+<div class="mb-3">
+<label class="form-label text-white-50 small fw-bold">Tablas disponibles</label>
+<select class="form-select form-select-sm" id="tablasSel" onchange="document.getElementById('sql').value=this.value">
+<option value="">— Elegir tabla —</option>${tabsHtml}
+</select>
+</div>
+<textarea id="sql" class="form-control txt-sql mb-3" rows="10" placeholder="SELECT * FROM tab_clientes LIMIT 20"></textarea>
+<div class="d-flex gap-2 flex-wrap align-items-center">
+<button class="btn btn-acc px-4" onclick="ejecutar()"><i class="bi bi-play-fill me-1"></i>Ejecutar (Ctrl+Enter)</button>
+<button class="btn btn-outline-light" style="border-radius:12px" onclick="document.getElementById('sql').value='SHOW TABLES';ejecutar()">SHOW TABLES</button>
+<a class="btn btn-outline-light" style="border-radius:12px" href="/entrenar">Volver a Entrenar</a>
+</div>
+</div>
+</div>
+<div class="col-lg-6">
+<div class="card-dash p-4">
+<h5 class="mb-2"><i class="bi bi-terminal me-2"></i>Resultado</h5>
+<div id="resultado" class="text-white-50 small">Aquí verás el resultado de la consulta.</div>
+</div>
+</div>
+</div>
+</div>
+<script>
+async function ejecutar(){
+    const sql=document.getElementById('sql').value.trim();
+    if(!sql)return alert("Escribe una consulta.");
+    const res=document.getElementById('resultado');
+    res.className="text-white-50 small";res.innerHTML="⏳ Ejecutando...";
+    try{
+        const r=await fetch('/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
+        const d=await r.json();
+        if(d.error){res.className="text-danger small fw-bold";res.innerHTML="❌ "+d.error.replace(/</g,'&lt;');return;}
+        if(!d.campos||d.filas===0){res.className="text-white-50 small";res.innerHTML="✅ "+d.filas+" fila(s), sin columnas.";return;}
+        const esc=v=>{v=(v===null||v===undefined)?'NULL':String(v);return v.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');};
+        let h="<div class='tbl-r'><table class='table table-dark table-striped'><thead><tr>"+d.campos.map(c=>"<th>"+esc(c)+"</th>").join("")+"</tr></thead><tbody>";
+        for(const row of d.rows){h+="<tr>"+d.campos.map(c=>"<td>"+esc(row[c])+"</td>").join("")+"</tr>";}
+        h+="</tbody></table></div>";
+        res.className="small";
+        res.innerHTML="<span class='text-info fw-bold'>✅ "+d.filas+" fila(s)</span>"+h;
+    }catch(e){res.className="text-danger small fw-bold";res.innerHTML="❌ "+e.message;}
+}
+document.getElementById('sql').addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter')ejecutar();});
+</script>
+</body></html>`);
+        }
     } else {
         const [zonas] = await pool.execute("SELECT DISTINCT zona FROM tab_clientes WHERE zona != '' AND zona IS NOT NULL ORDER BY zona");
         const zonaOptsMain = zonas.map(z => `<option value="${z.zona}">${z.zona}</option>`).join('');
@@ -4580,6 +4714,19 @@ ${hoyVis.length > 0 ? `
 </div>
 <span class="fw-bold" style="font-size:0.95rem">Entrenar al Bot</span>
 <span class="d-block mt-1" style="font-size:0.7rem;color:#b3a6ff">instrucciones + procesos on/off</span>
+</div>
+</div>
+</a>
+</div>
+<div class="col-6 col-sm-4 col-md-3">
+<a href="/sql" class="text-decoration-none">
+<div class="card-dash h-100">
+<div class="card-body">
+<div class="d-flex align-items-center gap-3 mb-2">
+<div class="icon-box" style="background:rgba(79,140,255,0.2);color:#6ea8fe"><i class="bi bi-database"></i></div>
+<small class="text-white-50 text-uppercase" style="font-size:0.65rem;letter-spacing:0.5px">SQL</small>
+</div>
+<span class="fw-bold" style="font-size:0.95rem">Consultas a la BD</span>
 </div>
 </div>
 </a>
