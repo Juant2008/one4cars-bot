@@ -485,6 +485,14 @@ const MESSAGE_TEMPLATES = {
         (n, nota, divisas, dias, bcv) => `📢 *ONE4CARS — Deuda Pendiente* 🚗\n\nHola *${n}*, le notificamos que la nota ${nota} por $${divisas} tiene ${dias} de vencida. Le agradecemos regularizar su situación.\n\n💰 Total Divisas: $${divisas}\nTotal Bs: ${bcv}\n\nSaludos cordiales. 🚗`,
         (n, nota, divisas, dias, bcv) => `📢 *ONE4CARS — Aviso de Cobro* 🚗\n\nEstimado(a) *${n}*, la nota ${nota} por $${divisas} supera los ${dias} de vencida. Le solicitamos efectuar el pago a la brevedad.\n\n💳 Total Divisas: $${divisas}\nTotal Bs: ${bcv}\n\nAgradecemos su atención. 🚗`,
         (n, nota, divisas, dias, bcv) => `📢 *ONE4CARS — Saldo Vencido* 🚗\n\nHola *${n}*, su nota ${nota} por $${divisas} se encuentra vencida desde hace ${dias}. Le agradecemos proceder con el pago.\n\n💰 Total Divisas: $${divisas}\nTotal Bs: ${bcv}\n\nGracias por confiar en ONE4CARS. 🚗`
+    ],
+    recordatorioVisita: [
+        (n) => `👋 Hola *${n}*, un cordial saludo del equipo ONE4CARS. Queremos invitarlo a agendar una visita de uno de nuestros asesores para atender sus requerimientos y ofrecerle lo mejor de nuestro catálogo. ¿Podemos visitarlo esta semana?`,
+        (n) => `📅 *${n}*, en ONE4CARS queremos mantenernos cerca de usted. ¿Le gustaría que un asesor le visite esta semana para conocer sus necesidades y mostrarle nuestras novedades?`,
+        (n) => `🚗 Hola *${n}*, desde ONE4CARS valoramos su preferencia. Queremos coordinar una visita de cortesía para seguir brindándole la mejor atención. ¿Qué día le queda cómodo?`,
+        (n) => `🛞 *${n}*, le saluda su asesor ONE4CARS. Estamos organizando las visitas de la semana y queremos incluirle. ¿Puede recibirnos estos días para conversar sobre cómo podemos servirle mejor?`,
+        (n) => `⭐ Hola *${n}*, soy su enlace ONE4CARS. Nos gustaría pasar por su negocio para una visita de seguimiento y atención personalizada. ¿Estaría disponible esta semana?`,
+        (n) => `🔧 *${n}*, reciba un cordial saludo de ONE4CARS. Queremos agendar una visita para conocer sus requerimientos actuales y ofrecerle lo mejor. ¿Cuándo le parece bien que pasemos?`
     ]
 };
 const pickTemplate = (arr) => arr[Math.floor(Math.random() * arr.length)];
@@ -4197,6 +4205,40 @@ const server = http.createServer(async (req, res) => {
                         await humanDelay(25, 50);
                     }
                     console.log(`[RECORDATORIO ESTADO] ${cont}/${ids.length} enviado(s).`);
+                }, 500);
+            } catch (e) { res.end("Error: " + e.message); }
+        });
+    } else if (routename === '/enviar-recordatorio-visita' && req.method === 'POST') {
+        if (!isBotReady()) { res.end("Bot no listo."); return; }
+        let b = ''; req.on('data', c => b += c);
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(b);
+                const ids = data.clientes || [];
+                if (ids.length === 0) { res.end("Ningún cliente seleccionado."); return; }
+                res.end(`✅ Envío iniciado para ${ids.length} cliente(s).`);
+                setTimeout(async () => {
+                    let cont = 0;
+                    const bs = sendConfig.batchSize;
+                    const pb = sendConfig.pauseBatch;
+                    const lunes = new Date();
+                    lunes.setDate(lunes.getDate() - ((lunes.getDay() + 6) % 7));
+                    const semanaInicio = lunes.toISOString().split('T')[0];
+                    for (let i = 0; i < ids.length; i++) {
+                        if (i > 0 && i % bs === 0) { console.log(`[REC VISITA] Pausa ${pb/60000}min lote ${i}/${ids.length}...`); await sleep(pb); }
+                        const [clientes] = await pool.execute("SELECT id_cliente, nombres, celular FROM tab_clientes WHERE id_cliente = ?", [ids[i]]);
+                        const c = clientes[0];
+                        if (!c) continue;
+                        const jid = formatWhatsApp(c.celular);
+                        if (!jid) continue;
+                        const tpl = pickTemplate(MESSAGE_TEMPLATES.recordatorioVisita);
+                        const msg = tpl(c.nombres);
+                        await safeSendMessage(jid, { text: msg });
+                        await dualExecute("INSERT IGNORE INTO recordatorio_visita_log (id_cliente, semana_inicio) VALUES (?, ?)", [c.id_cliente, semanaInicio]);
+                        cont++;
+                        await humanDelay(25, 50);
+                    }
+                    console.log(`[RECORDATORIO VISITA] ${cont}/${ids.length} enviado(s).`);
                 }, 500);
             } catch (e) { res.end("Error: " + e.message); }
         });
