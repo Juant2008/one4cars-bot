@@ -567,8 +567,12 @@ async function setModo(tel, modo) {
 const REACTIVAR_BOT_MS = 10 * 60 * 1000; // 10 minutos sin que el vendedor intervenga → el bot se reactiva solo
 
 async function silenciarChat(jid) {
-    await setModo(jid, 'humano');
-    console.log(`[SILENT] Bot silenciado para ${jid.split('@')[0]} (el vendedor atiende manualmente).`);
+    try {
+        await setModo(jid, 'humano');
+        console.log(`[SILENT] Bot silenciado para ${jid.split('@')[0]} (el vendedor atiende manualmente).`);
+    } catch (e) {
+        console.log(`[SILENT] Error silenciando ${jid}:`, e.message);
+    }
 }
 
 async function setSesionDatos(tel, datos) {
@@ -2342,37 +2346,42 @@ async function startBot() {
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         try {
+            // ===== INTERVENCIÓN HUMANA (mensajes salientes del vendedor) =====
+            // Se revisan TODOS los mensajes del lote ANTES del filtro de tipo, porque
+            // los mensajes que el vendedor envía desde WhatsApp Web / teléfono pueden
+            // llegar con type 'append' o no ser el primer mensaje del lote.
+            for (const m of (messages || [])) {
+                if (!m || !m.message || !m.key || !m.key.fromMe) continue;
+                const jid = m.key.remoteJid;
+                if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) continue;
+
+                const textMe = (m.message.conversation || m.message.extendedTextMessage?.text || "").toLowerCase().trim();
+                if (textMe === '!bot') {
+                    await setModo(jid, 'bot');
+                    await safeSendMessage(jid, { text: "🤖 Bot reactivado para este chat." });
+                    continue;
+                }
+                if (textMe === '!off' || textMe === '!callar' || textMe === '!silencio' || textMe === '!mute' || textMe === '!humano') {
+                    await silenciarChat(jid);
+                    continue;
+                }
+                // Si es un mensaje que el propio bot acaba de enviar automáticamente, NO silenciar.
+                const textoSaliente = m.message.conversation || m.message.extendedTextMessage?.text || m.message.imageMessage?.caption || '';
+                if (esEnvioBotReciente(jid, textoSaliente)) {
+                    continue;
+                }
+                // Cualquier otro mensaje saliente = el vendedor escribiendo manualmente al cliente → silenciar.
+                console.log(`[HUMAN] Mensaje saliente detectado de ${jid.split('@')[0]}: "${textMe.substring(0, 60)}"`);
+                await silenciarChat(jid);
+            }
+
             const msg = messages[0];
             if (!msg || !msg.message) return;
+            if (type !== 'notify') return;
+            if (msg.key.fromMe) return;
 
             const from = msg.key.remoteJid;
             if (from === 'status@broadcast' || from.includes('@g.us')) return;
-
-            // ===== INTERVENCIÓN HUMANA (mensajes salientes del vendedor) =====
-            // Se procesa ANTES del filtro de tipo porque los mensajes que el vendedor
-            // envía desde WhatsApp Web / teléfono pueden llegar con type 'append' (no 'notify').
-            if (msg.key.fromMe) {
-                const textMe = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").toLowerCase().trim();
-                if (textMe === '!bot') {
-                    await setModo(from, 'bot');
-                    await safeSendMessage(from, { text: "🤖 Bot reactivado para este chat." });
-                    return;
-                }
-                if (textMe === '!off' || textMe === '!callar' || textMe === '!silencio' || textMe === '!mute' || textMe === '!humano') {
-                    await silenciarChat(from);
-                    return;
-                }
-                // Si es un mensaje que el propio bot acaba de enviar automáticamente, NO silenciar.
-                const textoSaliente = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || '';
-                if (esEnvioBotReciente(from, textoSaliente)) {
-                    return;
-                }
-                // Cualquier otro mensaje saliente = el vendedor está escribiendo manualmente al cliente → silenciar el bot.
-                await silenciarChat(from);
-                return;
-            }
-
-            if (type !== 'notify') return;
 
             const isAdmin = ADMIN_IDS.some(id => from.includes(id));
             const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
@@ -2459,6 +2468,7 @@ async function startBot() {
                     await setModo(from, 'bot');
                     console.log(`[AUTO-REACT] ${from.split('@')[0]} reactivado tras ${REACTIVAR_BOT_MS/60000} min sin intervención del vendedor.`);
                 } else {
+                    console.log(`[QUIET] Bot en silencio para ${from.split('@')[0]} (modo humano).`);
                     return;
                 }
             }
