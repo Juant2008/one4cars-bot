@@ -410,9 +410,48 @@ function soloNumerosRIF(texto) {
     return texto.replace(/\D/g, '');
 }
 
+// ===== DETECCIÓN DE MENSAJES AUTOMÁTICOS DEL BOT =====
+// Registra lo que el bot envía para NO confundirlo con escritura manual del vendedor.
+const botEnvios = new Map(); // jid -> [{ texto, ts }]
+
+function extraerTextoContenido(content) {
+    if (!content) return '';
+    if (typeof content === 'string') return content;
+    if (content.text) return String(content.text);
+    if (content.caption) return String(content.caption);
+    return '';
+}
+function normalizarParaComparar(t) {
+    return String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+function registrarEnvioBot(jid, texto) {
+    const t = normalizarParaComparar(texto);
+    if (!t || !jid) return;
+    if (!botEnvios.has(jid)) botEnvios.set(jid, []);
+    const arr = botEnvios.get(jid);
+    arr.push({ texto: t, ts: Date.now() });
+    if (arr.length > 30) arr.splice(0, arr.length - 30);
+    if (botEnvios.size > 500) {
+        const exp = Date.now() - 60000;
+        for (const [k, v] of botEnvios) {
+            const filtrado = v.filter(x => x.ts > exp);
+            if (filtrado.length === 0) botEnvios.delete(k); else botEnvios.set(k, filtrado);
+        }
+    }
+}
+function esEnvioBotReciente(jid, texto) {
+    const t = normalizarParaComparar(texto);
+    if (!t || !jid) return false;
+    const arr = botEnvios.get(jid);
+    if (!arr) return false;
+    const ahora = Date.now();
+    return arr.some(x => x.texto === t && (ahora - x.ts) < 30000);
+}
+
 async function safeSendMessage(jid, content) {
     try {
         if (!socketBot) throw new Error("Socket no inicializado");
+        registrarEnvioBot(jid, extraerTextoContenido(content));
         await socketBot.sendMessage(jid, content);
         console.log(`[MSG] ✅ Mensaje enviado a ${jid}`);
     } catch (e) {
@@ -521,7 +560,16 @@ async function guardarMensaje(tel, rol, contenido) {
 async function setModo(tel, modo) {
     await pool.execute("INSERT INTO control_chat (telefono, modo, updated_at) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE modo = VALUES(modo), updated_at = NOW()", [tel, modo]);
 }
-const REACTIVAR_BOT_MS = 5 * 60 * 1000; // 5 minutos sin que el humano intervenga → el bot se reactiva solo
+
+// Silencia el bot para un chat (el vendedor lo atiende manualmente).
+// Se reactiva automáticamente tras REACTIVAR_BOT_MS (10 min) sin intervención humana,
+// o manualmente con el comando "!bot".
+const REACTIVAR_BOT_MS = 10 * 60 * 1000; // 10 minutos sin que el vendedor intervenga → el bot se reactiva solo
+
+async function silenciarChat(jid) {
+    await setModo(jid, 'humano');
+    console.log(`[SILENT] Bot silenciado para ${jid.split('@')[0]} (el vendedor atiende manualmente).`);
+}
 
 async function setSesionDatos(tel, datos) {
     try {
@@ -2294,32 +2342,40 @@ async function startBot() {
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         try {
-            if (type !== 'notify') return;
             const msg = messages[0];
-            if (!msg.message) return;
+            if (!msg || !msg.message) return;
 
             const from = msg.key.remoteJid;
             if (from === 'status@broadcast' || from.includes('@g.us')) return;
 
-            const isAdmin = ADMIN_IDS.some(id => from.includes(id));
-            const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
-
+            // ===== INTERVENCIÓN HUMANA (mensajes salientes del vendedor) =====
+            // Se procesa ANTES del filtro de tipo porque los mensajes que el vendedor
+            // envía desde WhatsApp Web / teléfono pueden llegar con type 'append' (no 'notify').
             if (msg.key.fromMe) {
-                const textMe = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").toLowerCase();
+                const textMe = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").toLowerCase().trim();
                 if (textMe === '!bot') {
                     await setModo(from, 'bot');
                     await safeSendMessage(from, { text: "🤖 Bot reactivado para este chat." });
                     return;
                 }
-                // Solo procesar fromMe si es auto-chat (admin hablando consigo mismo)
-                const botPhone = (socketBot?.user?.id || '').split('@')[0].split(':')[0];
-                const fromPhone = from.split('@')[0].split(':')[0];
-                if (botPhone && botPhone !== fromPhone) {
-                    await setModo(from, 'humano');
-                    console.log(`[SILENT] Bot silenciado para ${from.split('@')[0]} (admin conversando con cliente)`);
+                if (textMe === '!off' || textMe === '!callar' || textMe === '!silencio' || textMe === '!mute' || textMe === '!humano') {
+                    await silenciarChat(from);
                     return;
                 }
+                // Si es un mensaje que el propio bot acaba de enviar automáticamente, NO silenciar.
+                const textoSaliente = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || '';
+                if (esEnvioBotReciente(from, textoSaliente)) {
+                    return;
+                }
+                // Cualquier otro mensaje saliente = el vendedor está escribiendo manualmente al cliente → silenciar el bot.
+                await silenciarChat(from);
+                return;
             }
+
+            if (type !== 'notify') return;
+
+            const isAdmin = ADMIN_IDS.some(id => from.includes(id));
+            const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
 
             const pushName = msg.pushName || "Usuario";
             let rawText = (msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || "").trim();
@@ -2397,9 +2453,11 @@ async function startBot() {
             }
 
             if (sesion && sesion.modo === 'humano' && !isAdmin) {
+                // El vendedor atiende este chat manualmente: el bot se mantiene en silencio.
+                // Se reactiva solo tras 10 minutos sin intervención humana, o con "!bot".
                 if (sesion.updated_at && (Date.now() - new Date(sesion.updated_at).getTime()) > REACTIVAR_BOT_MS) {
                     await setModo(from, 'bot');
-                    console.log(`[AUTO-REACT] ${from.split('@')[0]} reactivado tras ${REACTIVAR_BOT_MS/3600000}h sin actividad humana.`);
+                    console.log(`[AUTO-REACT] ${from.split('@')[0]} reactivado tras ${REACTIVAR_BOT_MS/60000} min sin intervención del vendedor.`);
                 } else {
                     return;
                 }
@@ -2588,7 +2646,7 @@ async function startBot() {
                     const caption = `📦 *CÓDIGO: ${p.producto}*\n💰 *Precio: $${precio.toFixed(2)} (Pagadero a tasa BCV)*${infoStock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`;
                     const imgUrl = `https://one4cars.com/imagen/${p.producto}.jpg`;
                     try {
-                        await socketBot.sendMessage(from, { image: { url: imgUrl }, caption: caption });
+                        registrarEnvioBot(from, caption); await socketBot.sendMessage(from, { image: { url: imgUrl }, caption: caption });
                     } catch (imgErr) {
                         await safeSendMessage(from, { text: caption });
                     }
@@ -3420,7 +3478,7 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                             const caption = `📦 *CÓDIGO: ${p.producto}*\n💰 *Precio: $${precio.toFixed(2)} (Pagadero a tasa BCV)*${infoStock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`;
                             const imgUrl = `https://one4cars.com/imagen/${p.producto}.jpg`;
                             try {
-                                await socketBot.sendMessage(from, { image: { url: imgUrl }, caption: caption });
+                                registrarEnvioBot(from, caption); await socketBot.sendMessage(from, { image: { url: imgUrl }, caption: caption });
                             } catch (imgErr) {
                                 await safeSendMessage(from, { text: caption });
                             }
