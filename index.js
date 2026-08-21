@@ -566,13 +566,23 @@ async function setModo(tel, modo) {
 // o manualmente con el comando "!bot".
 const REACTIVAR_BOT_MS = 10 * 60 * 1000; // 10 minutos sin que el vendedor intervenga → el bot se reactiva solo
 
+// Control del silencio EN MEMORIA (evita desfases de zona horaria entre MySQL y Node).
+// Clave: jid -> timestamp (ms) hasta el cual el bot debe permanecer callado.
+const chatsSilenciados = new Map();
+
 async function silenciarChat(jid) {
+    chatsSilenciados.set(jid, Date.now() + REACTIVAR_BOT_MS);
     try {
         await setModo(jid, 'humano');
         console.log(`[SILENT] Bot silenciado para ${jid.split('@')[0]} (el vendedor atiende manualmente).`);
     } catch (e) {
         console.log(`[SILENT] Error silenciando ${jid}:`, e.message);
     }
+}
+
+async function reactivarChat(jid) {
+    chatsSilenciados.delete(jid);
+    await setModo(jid, 'bot');
 }
 
 async function setSesionDatos(tel, datos) {
@@ -2357,7 +2367,7 @@ async function startBot() {
 
                 const textMe = (m.message.conversation || m.message.extendedTextMessage?.text || "").toLowerCase().trim();
                 if (textMe === '!bot') {
-                    await setModo(jid, 'bot');
+                    await reactivarChat(jid);
                     await safeSendMessage(jid, { text: "🤖 Bot reactivado para este chat." });
                     continue;
                 }
@@ -2461,14 +2471,20 @@ async function startBot() {
                 }
             }
 
-            if (sesion && sesion.modo === 'humano' && !isAdmin) {
-                // El vendedor atiende este chat manualmente: el bot se mantiene en silencio.
-                // Se reactiva solo tras 10 minutos sin intervención humana, o con "!bot".
-                if (sesion.updated_at && (Date.now() - new Date(sesion.updated_at).getTime()) > REACTIVAR_BOT_MS) {
-                    await setModo(from, 'bot');
+            if (!isAdmin) {
+                const silenciadoHasta = chatsSilenciados.get(from);
+                if (silenciadoHasta) {
+                    if (silenciadoHasta > Date.now()) {
+                        console.log(`[QUIET] Bot en silencio para ${from.split('@')[0]} (modo humano).`);
+                        return;
+                    }
+                    // Venció el tiempo de silencio → reactivar.
+                    await reactivarChat(from);
                     console.log(`[AUTO-REACT] ${from.split('@')[0]} reactivado tras ${REACTIVAR_BOT_MS/60000} min sin intervención del vendedor.`);
-                } else {
-                    console.log(`[QUIET] Bot en silencio para ${from.split('@')[0]} (modo humano).`);
+                } else if (sesion && sesion.modo === 'humano') {
+                    // Venía silenciado desde la BD (p. ej. tras un reinicio): renovar la ventana.
+                    chatsSilenciados.set(from, Date.now() + REACTIVAR_BOT_MS);
+                    console.log(`[QUIET] Bot en silencio (persistido) para ${from.split('@')[0]}.`);
                     return;
                 }
             }
