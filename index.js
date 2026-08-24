@@ -1734,7 +1734,7 @@ async function actualizarDolar() {
     } catch (e) { console.log("Error Dolar API"); }
     try {
         const binanceResp = await axios.post('https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search',
-            { asset: 'USDT', fiat: 'VES', tradeType: 'BUY', page: 1, rows: 3, payTypes: [] },
+            { asset: 'USDT', fiat: 'VES', tradeType: 'SELL', page: 1, rows: 3, payTypes: [] },
             { headers: { 'Content-Type': 'application/json;charset=utf-8', 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }, timeout: 7000 });
         const ads = binanceResp.data && binanceResp.data.data;
         if (Array.isArray(ads) && ads.length > 0) {
