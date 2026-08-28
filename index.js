@@ -743,6 +743,25 @@ function detectarVisita(rawText, text) {
     return false;
 }
 
+// Detecta un comprobante de transferencia/pago móvil (texto leído por OCR o escrito).
+// Devuelve true si el texto tiene los indicadores típicos de una operación bancaria exitosa.
+function detectarTransferencia(texto) {
+    if (!texto) return false;
+    const t = normalizar(texto); // sin acentos, minúsculas, sin puntuación
+    const tieneExito = /(operacion|transaccion|transferencia|pago)\s*exitosa?/.test(t) || t.includes('exitoso') || t.includes('exitosa');
+    const tieneReferencia = t.includes('referencia');
+    const tieneBanco = t.includes('banco');
+    const tieneMonto = t.includes('monto');
+    const tieneReceptor = t.includes('receptor') || t.includes('destino') || t.includes('beneficiario');
+    // "operación exitosa" acompañada de algún dato bancario
+    if (tieneExito && (tieneReferencia || tieneMonto || tieneBanco || tieneReceptor)) return true;
+    // Comprobante típico: referencia + banco + monto
+    if (tieneReferencia && tieneBanco && tieneMonto) return true;
+    // banco + monto + receptor/destino
+    if (tieneBanco && tieneMonto && tieneReceptor) return true;
+    return false;
+}
+
 function parsearFechaVisita(texto) {
     const t = normalizar(texto);
     const hoy = new Date();
@@ -2398,14 +2417,17 @@ async function startBot() {
 
             const pushName = msg.pushName || "Usuario";
             let rawText = (msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || "").trim();
+            let textoOcr = '';
 
-            // ===== LECTURA DE PEDIDOS POR IMAGEN (OCR GRATUITO) =====
-            if (!rawText && msg.message.imageMessage) {
-                console.log(`[IMG] Imagen recibida de ${from.split('@')[0]}, extrayendo pedido con OCR...`);
-                const textoOcr = await extraerTextoDeImagen(msg);
-                if (textoOcr && textoOcr.length > 0) {
-                    rawText = textoOcr;
-                    console.log(`[IMG] Texto OCR detectado: ${rawText.substring(0, 250)}`);
+            // ===== LECTURA DE IMÁGENES POR OCR (GRATUITO con Tesseract.js) =====
+            // Se intenta extraer texto de la imagen siempre; si trae caption, se combina.
+            if (msg.message.imageMessage) {
+                console.log(`[IMG] Imagen recibida de ${from.split('@')[0]}, extrayendo texto con OCR...`);
+                const ocr = await extraerTextoDeImagen(msg);
+                if (ocr && ocr.length > 0) {
+                    textoOcr = ocr;
+                    console.log(`[IMG] Texto OCR detectado: ${ocr.substring(0, 250)}`);
+                    if (!rawText) rawText = ocr;
                 }
             }
             if (!rawText) return;
@@ -2487,6 +2509,20 @@ async function startBot() {
                     console.log(`[QUIET] Bot en silencio (persistido) para ${from.split('@')[0]}.`);
                     return;
                 }
+            }
+
+            // --- DETECCIÓN DE COMPROBANTE DE TRANSFERENCIA / PAGO (imagen por OCR o texto) ---
+            // Se procesa ANTES del flujo de pedidos/productos para no confundir la referencia
+            // o cédula del comprobante con un código de producto.
+            if (detectarTransferencia(rawText) || detectarTransferencia(textoOcr)) {
+                const nombrePago = vendedor ? vendedor.nombre : (nombreAlmacenado || nombreExtraido || pushName || "Usuario");
+                console.log(`[PAGO] Comprobante de transferencia detectado de ${from.split('@')[0]}.`);
+                await safeSendMessage(from, { text: `✅ *Recibimos tu comprobante de transferencia.*\n\nAdministración lo validará a la brevedad y actualizará tu estado de cuenta. ¡Gracias por tu pago, ${nombrePago}! 🙏\n\nPuedes consultar tus facturas pendientes aquí:\n2️⃣ *Estado de cuenta:* https://www.one4cars.com/estado_de_cuenta.php/` });
+                const adminJids = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
+                for (const aj of adminJids) {
+                    await safeSendMessage(aj, { text: `💵 *COMPROBANTE DE PAGO RECIBIDO*\nDe: ${nombrePago}\nTel: ${from.split('@')[0]}\n\nEl cliente envió una imagen de transferencia. Revísala en el chat para validarla.` });
+                }
+                return;
             }
 
             // --- 0a. COMANDOS DE IA (ADMIN) — se procesan primero para que no se confundan con productos/menú ---
