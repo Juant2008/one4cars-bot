@@ -376,6 +376,27 @@ const PRODUCT_KEYWORDS = [
     'cargador', 'cargadores', 'arrancador', 'arrancadores', 'pasacorriente'
 ];
 
+const COMPLAINT_KEYWORDS = [
+    'falto', 'faltó', 'falta', 'faltan', 'faltaba',
+    'danado', 'dañado', 'roto', 'rota', 'defectuoso', 'defectuosa',
+    'malogrado', 'malograda', 'averiado', 'averiada',
+    'incorrecto', 'incorrecta', 'equivocado', 'equivocada',
+    'diferente', 'distinto', 'distinta',
+    'no sirve', 'no funciona', 'no prende', 'no enciende',
+    'problema', 'problemas', 'incidente', 'incidencia',
+    'reclamo', 'queja', 'disconformidad', 'insatisfaccion',
+    'no me gusta', 'muy mal', 'pésimo', 'pesimo', 'horrible',
+    'le sobro', 'le sobró', 'sobra', 'sobran', 'sobrante',
+    'cambiar', 'cambio', 'devolver', 'devolucion', 'garantia', 'garantía',
+    'reembolso', 'reemplazo', 'reponer',
+    'caja vacia', 'caja incompleta', 'paquete incompleto',
+    'unidad faltante', 'pieza faltante', 'articulo faltante',
+    'medio caja', 'media caja',
+    'fabrica', 'fábrica', 'de fabrica', 'de fábrica',
+    'empaque', 'empaque roto', 'empaque danado',
+    'etiqueta', 'etiqueta equivocada', 'etiqueta incorrecta'
+];
+
 // ===== FUNCIONES DE APOYO =====
 
 function normalizar(texto) {
@@ -3472,6 +3493,22 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                 try {
                     const palabrasEnMensaje = rawText.split(/\s+/);
                     const txtNormal = normalizar(rawText);
+
+                    // --- DETECCIÓN DE RECLAMO / QUEJA / INCIDENCIA ---
+                    // Si el mensaje es un reclamo, NO buscar productos (evita falsos positivos).
+                    const esReclamo = COMPLAINT_KEYWORDS.some(kw => txtNormal.includes(kw));
+                    if (esReclamo) {
+                        console.log(`[RECLAMO] Mensaje clasificado como reclamo/queja: "${rawText.substring(0, 80)}"`);
+                        const nombreUsuario = nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || "Usuario";
+                        await safeSendMessage(from, { text: `Entendido, *${nombreUsuario}*. Lamentamos que tenga ese inconveniente. 🙏\n\nPara atender su reclamo de la mejor manera, un asesor de ONE4CARS se comunicará con usted a la brevedad.\n\n📝 *Por favor indique:*\n1️⃣ Número de factura o código del producto\n2️⃣ Descripción del problema\n\n📌 También puede solicitar un *asesor humano* escribiendo *9*.` });
+                        // Notificar a admins del reclamo
+                        const adminJids = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
+                        for (const aj of adminJids) {
+                            await safeSendMessage(aj, { text: `⚠️ *RECLAMO/QUEJA DETECTADO*\nDe: ${nombreUsuario}\nTel: ${from.split('@')[0]}\n\nMensaje: ${rawText.substring(0, 300)}` });
+                        }
+                        return;
+                    }
+
                     const contieneKeyword = PRODUCT_KEYWORDS.some(kw => txtNormal.includes(kw));
                     const tieneCodigo = palabrasEnMensaje.some(p => {
                         const c = p.replace(/[^a-zA-Z0-9]/g, '');
