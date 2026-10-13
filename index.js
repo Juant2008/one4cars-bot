@@ -31,9 +31,12 @@ async function reiniciarOcrWorker() {
     tesseractWorker = null;
 }
 
-async function preprocesarImagen(buffer) {
+async function preprocesarImagen(buffer, angulo = 0) {
     try {
-        return await sharp(buffer)
+        let pipeline = sharp(buffer);
+        // Si la foto viene girada (ej: RIF de lado), se rota antes de leer
+        if (angulo) pipeline = pipeline.rotate(angulo);
+        return await pipeline
             .resize({ width: 2000, withoutEnlargement: false })
             .grayscale()
             .sharpen()
@@ -45,21 +48,121 @@ async function preprocesarImagen(buffer) {
     }
 }
 
+function palabrasLargasOcr(texto) {
+    return ((texto || '').match(/[A-Za-zÁÉÍÓÚáéíóúñÑ]{5,}/g) || []).length;
+}
+
+function ratioLetrasOcr(texto) {
+    const sinEspacios = (texto || '').replace(/\s/g, '');
+    if (sinEspacios.length === 0) return 0;
+    const letras = ((texto || '').match(/[A-Za-zÁÉÍÓÚáéíóúñÑ]/g) || []).length;
+    return letras / sinEspacios.length;
+}
+
+// Texto mínimo legible: documentos reales tienen palabras largas o códigos tipo MF1410.
+// El basura típico de una foto girada (letras sueltas "E > 2 mE") NO pasa estos filtros.
+function ocrEsLegible(texto) {
+    const t = (texto || '').trim();
+    if (t.replace(/\s/g, '').length < 12) return false;
+    const codigos = (t.match(/\b[A-Za-z]{1,5}\d{3,8}\b/g) || []).length;
+    return palabrasLargasOcr(t) >= 2 || codigos >= 1;
+}
+
+function puntuarOcr(texto, confianza) {
+    const t = (texto || '').trim();
+    if (!t) return -1;
+    return (confianza || 0) + Math.min(palabrasLargasOcr(t), 40) * 2 + ratioLetrasOcr(t) * 20;
+}
+
 async function extraerTextoDeImagen(msg) {
     try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {}, pino({ level: 'silent' }));
         if (!buffer || buffer.length === 0) return null;
-        const buffPre = await preprocesarImagen(buffer);
         const worker = await getOcrWorker();
         if (!worker) return null;
-        const { data } = await worker.recognize(buffPre);
-        const texto = (data.text || '').trim();
-        return texto || null;
+
+        let mejorTexto = '';
+        let mejorPuntaje = -1;
+        let mejorConfianza = 0;
+        let intentosSinTexto = 0;
+
+        // Se prueba 0°, 90°, 180° y 270° para corregir documentos fotografiados girados
+        for (const angulo of [0, 90, 180, 270]) {
+            const buffPre = await preprocesarImagen(buffer, angulo);
+            const { data } = await worker.recognize(buffPre);
+            const texto = (data.text || '').trim();
+            const confianza = data.confidence || 0;
+
+            if (texto.replace(/\s/g, '').length < 12) {
+                intentosSinTexto++;
+                // Foto sin texto (ej: producto): 0° y 90° vacíos → no tiene sentido seguir rotando
+                if (intentosSinTexto >= 2) return null;
+                continue;
+            }
+            intentosSinTexto = 0;
+
+            const puntaje = puntuarOcr(texto, confianza);
+            if (puntaje > mejorPuntaje) {
+                mejorPuntaje = puntaje;
+                mejorTexto = texto;
+                mejorConfianza = confianza;
+            }
+            const palabras = palabrasLargasOcr(texto);
+            if ((confianza >= 75 && palabras >= 3) || palabras >= 8) break;
+        }
+
+        if (!ocrEsLegible(mejorTexto)) {
+            console.log(`[OCR] Texto ilegible descartado (conf=${Number(mejorConfianza).toFixed(1)}): "${(mejorTexto || '').substring(0, 80)}"`);
+            return null;
+        }
+        console.log(`[OCR] Texto legible (conf=${Number(mejorConfianza).toFixed(1)}): ${mejorTexto.substring(0, 120)}`);
+        return mejorTexto;
     } catch (e) {
         console.log("[OCR] Error al leer la imagen:", e.message);
         try { await reiniciarOcrWorker(); } catch (e2) {}
         return null;
     }
+}
+
+// ===== DETECCIÓN DE DOCUMENTO RIF (SENIAT) =====
+function detectarComprobanteRif(texto) {
+    if (!texto) return false;
+    const t = texto.normalize("NFD").replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/\s+/g, ' ');
+    if (t.includes('REGISTRO UNICO DE INFORMACION FISCAL')) return true;
+    if (t.includes('SENIAT') && t.includes('RIF')) return true;
+    if (t.includes('DOMICILIO FISCAL') && t.includes('RIF')) return true;
+    return false;
+}
+
+function extraerDatosRif(texto) {
+    const res = { rif: '', nombre: '' };
+    if (!texto) return res;
+    const lineas = texto.split(/\n/).map(l => l.trim()).filter(Boolean);
+    let mejorNombre = '';
+    for (const linea of lineas) {
+        const m = linea.match(/\b([VJEG])\s*[-.]?\s*(\d{7,9})\b/i);
+        if (!m) continue;
+        if (!res.rif) res.rif = `${m[1].toUpperCase()}-${m[2]}`;
+        const resto = linea.slice((m.index || 0) + m[0].length).trim();
+        const mNom = resto.match(/^([A-Za-zÁÉÍÓÚáéíóúñÑ](?:[ A-Za-zÁÉÍÓÚáéíóúñÑ.]){3,50})/);
+        if (mNom && mNom[1].trim().split(' ').length >= 2) {
+            mejorNombre = mNom[1].trim().replace(/\s+/g, ' ');
+            res.rif = `${m[1].toUpperCase()}-${m[2]}`;
+            break;
+        }
+    }
+    if (mejorNombre) res.nombre = mejorNombre;
+    return res;
+}
+
+// Valida que un texto sea un nombre (persona/empresa) y no basura de OCR u otro texto largo.
+function esNombreValido(texto) {
+    const t = (texto || '').trim();
+    if (t.length < 3 || t.length > 60) return false;
+    if (t.includes('\n') || t.includes('\r')) return false;
+    // Letras, dígitos, espacios y signos comunes de nombres; la basura de OCR tiene muchos símbolos (| > : = etc.)
+    const validos = (t.match(/[A-Za-zÁÉÍÓÚáéíóúñÑ0-9\s.·'’&-]/g) || []).length;
+    return validos / t.length >= 0.8;
 }
 
 // Corrige errores típicos de OCR en códigos de producto (1→L, 4→A, 0→O, 8→B, etc.)
@@ -2546,6 +2649,21 @@ async function startBot() {
                 return;
             }
 
+            // --- DOCUMENTO RIF / COMPROBANTE FISCAL (SENIAT) ---
+            // Fotos del RIF (a menudo de lado): se confirma la recepción y se avisa a administración,
+            // en vez de tratar el texto OCR como si fuera un nombre de vendedor o de cliente.
+            if (textoOcr && detectarComprobanteRif(textoOcr)) {
+                const datosRif = extraerDatosRif(textoOcr);
+                const nombreRif = datosRif.nombre || nombreAlmacenado || nombreExtraido || pushName || 'Cliente';
+                console.log(`[RIF] Comprobante RIF detectado de ${from.split('@')[0]}: ${datosRif.rif || 'RIF no legible'}`);
+                await safeSendMessage(from, { text: `✅ *Recibimos su Registro Único de Información Fiscal (RIF).*${datosRif.rif ? `\n\n🪪 RIF: *${datosRif.rif}*` : ''}${datosRif.nombre ? `\n👤 Titular: *${datosRif.nombre}*` : ''}\n\nUn administrador lo revisará y lo registrará a la brevedad. ¡Gracias por su comunicación! 🙏\n\n_Si necesita otra ayuda, escriba la palabra *Menú*._` });
+                const adminJidsRif = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
+                for (const aj of adminJidsRif) {
+                    await safeSendMessage(aj, { text: `🪪 *RIF RECIBIDO POR WHATSAPP*\nDe: ${nombreRif}\nTel: ${from.split('@')[0]}\nRIF: ${datosRif.rif || 'No detectado'}\nTitular: ${datosRif.nombre || 'No detectado'}\n\n_Imagen del RIF en el chat._` });
+                }
+                return;
+            }
+
             // --- 0a. COMANDOS DE IA (ADMIN) — se procesan primero para que no se confundan con productos/menú ---
             if (isAdmin && (text === 'ia' || text === 'estado ia' || text === 'ia on' || text === 'ia off' || text.startsWith('ia key ') || text === 'saldo' || text === 'saldo ia' || text === 'saldo deeepseek' || text === 'ia saldo')) {
                 if (text === 'ia' || text === 'estado ia') {
@@ -2579,13 +2697,41 @@ async function startBot() {
 
             // --- 0. BIENVENIDA PRIMERA VEZ + SALUDO ---
             if (!sesion) {
-                // Si es lista de precios/catálogo, agradecer en lugar de bienvenida
-                if (/\b(lista\s*de\s*precios|catalogo|catálogo|listado)\b/i.test(rawText)) {
+                const esPregunta = rawText.includes('?') ||
+                    /\b(tienen|tiene|cuentan|cuenta con|puedo ver|pasame|pas[aá]me|env[ií]eme|env[ií]ame|compart[aá]me|mandame|m[aá]ndame|me pueden|me podr[ií]an|cu[aá]les|cu[aá]l|d[oó]nde|donde|favor)\b/i.test(rawText);
+                const mencionaCatalogo = /cat[aá]logo/i.test(rawText);
+                const mencionaListaPrecios = /\b(lista\s*de\s*precios|listado\s*de\s*precios)\b/i.test(rawText) || /adjunt/i.test(rawText);
+                const mencionaDespacho = /\b(despachan|despacho|env[ií]an a|entregan a|llevan a|guarenas|guatire)\b/i.test(rawText);
+
+                // Solo se agradece la lista de precios cuando es un ENVÍO (proveedor),
+                // nunca cuando el cliente pregunta por nuestro catálogo o lista de precios.
+                const esEnvioListaPrecios = mencionaListaPrecios && !esPregunta && !mencionaDespacho;
+                if (esEnvioListaPrecios) {
                     const nomProv = nombreExtraido || pushName || "Proveedor";
+                    await guardarUsuario(from, pushName, 0);
                     await safeSendMessage(from, { text: `📥 *${nomProv}*, hemos recibido su lista de precios. Agradecemos su comunicación y la estaremos revisando. ¡Gracias por contactarnos! 🙏` });
                     return;
                 }
+
                 await guardarUsuario(from, pushName, 0);
+
+                // Cliente nuevo preguntando por catálogo / lista de precios / despachos → responder de inmediato
+                if (esPregunta && (mencionaCatalogo || mencionaListaPrecios || mencionaDespacho)) {
+                    let msgBien = `🎉 *¡Bienvenido a ONE4CARS, ${pushName}!* 🎉\n\nSomos *Juan* y *José*, sus asesores de confianza en autopartes.\n\n`;
+                    if (mencionaListaPrecios) {
+                        msgBien += `💰 *Lista de precios:* https://www.one4cars.com/lista_de_precios.php/\n\n`;
+                    }
+                    if (mencionaCatalogo) {
+                        msgBien += `📚 *Catálogo de productos:* ${PDF_URL_CATALOGO}\n\n🔍 También puede consultar disponibilidad y precios escribiendo la opción *7* (Consulta de productos).\n\n`;
+                    }
+                    if (mencionaDespacho) {
+                        msgBien += `🚚 *Despachos:* contamos con servicio de despacho en varias zonas. Un asesor confirmará la disponibilidad para su zona (Guarenas/Guatire) a la brevedad.\n\n📌 Si desea una respuesta inmediata, escriba *9* y un asesor humano le atenderá. Para seguimiento de un envío use la opción *8*.\n\n`;
+                    }
+                    msgBien += `_Escriba la palabra *Menú* para más opciones e información._`;
+                    await safeSendMessage(from, { text: msgBien });
+                    return;
+                }
+
                 const msg = `🎉 *¡Bienvenido a ONE4CARS, ${pushName}!* 🎉\n\nSomos *Juan* y *José*, sus asesores de confianza en autopartes. Estamos aquí para ayudarlo con todo lo que necesite, desde filtros y frenos hasta piezas especializadas.\n\n¿En qué podemos servirle el día de hoy? _Escriba la palabra *Menú* para más opciones e información._`;
                 await safeSendMessage(from, { text: msg });
                 return;
@@ -2978,6 +3124,10 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                     await safeSendMessage(from, { text: "❌ Por favor escriba un nombre de vendedor válido (mínimo 3 caracteres)." });
                     return;
                 }
+                if (!esNombreValido(nombreVendedor)) {
+                    await safeSendMessage(from, { text: "❌ Ese texto no parece un nombre de vendedor.\n\nEscriba *solo el nombre* (ej: *Juan Pérez*) o *cancelar* para cancelar el pedido." });
+                    return;
+                }
                 // Detectar vendedores de oficina (Juan, Juan Trujillo, Jose Cabral)
                 const nombreNorm = normalizar(nombreVendedor);
                 const nombresOficina = ['juan', 'juan trujillo', 'jose cabral'];
@@ -2999,7 +3149,7 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                         [`%${nombreVendedor}%`]
                     );
                     if (rows.length === 0) {
-                        await safeSendMessage(from, { text: `❌ No encontré un vendedor llamado "*${nombreVendedor}*" en la base de datos.\n\nPuede que no esté registrado como activo. Contacte a un administrador o escriba otro nombre.\n\nEscriba *cancelar* para cancelar el pedido.` });
+                        await safeSendMessage(from, { text: `❌ No encontré un vendedor llamado "*${nombreVendedor.substring(0, 40)}*" en la base de datos.\n\nPuede que no esté registrado como activo. Contacte a un administrador o escriba otro nombre.\n\nEscriba *cancelar* para cancelar el pedido.` });
                         return;
                     }
                     vendedorEncontrado = rows[0];
@@ -3062,6 +3212,10 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                     return;
                 }
                 const nombreClienteBusqueda = rawText.trim();
+                if (!esNombreValido(nombreClienteBusqueda)) {
+                    await safeSendMessage(from, { text: "❌ Ese texto no parece un nombre de cliente.\n\nEscriba *solo el nombre o razón social* (ej: *Refacciones El Tigre*) o *cancelar* para cancelar el pedido." });
+                    return;
+                }
                 let clienteEncontrado = null;
                 if (vendedorSesion) {
                     clienteEncontrado = await buscarClientePorNombreYVendedor(nombreClienteBusqueda, vendedorSesion.nombre);
@@ -3087,7 +3241,7 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                             console.log("[DEBUG_CLIENTE] Clientes del vendedor:", JSON.stringify(allRows));
                         }
                     } catch (de) { console.log("[DEBUG_CLIENTE] Error debug:", de.message); }
-                    await safeSendMessage(from, { text: `❌ No encontré un cliente llamado "*${nombreClienteBusqueda}*".\n\nEscriba el nombre exacto o *cancelar* para cancelar el pedido.` });
+                    await safeSendMessage(from, { text: `❌ No encontré un cliente llamado "*${nombreClienteBusqueda.substring(0, 40)}*".\n\nEscriba el nombre exacto o *cancelar* para cancelar el pedido.` });
                     return;
                 }
                 const credito = await verificarCreditoCliente(clienteEncontrado.id_cliente);
@@ -3176,6 +3330,10 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                     await safeSendMessage(from, { text: "❌ Por favor escriba un nombre válido." });
                     return;
                 }
+                if (!esNombreValido(nombreCliente)) {
+                    await safeSendMessage(from, { text: "❌ Ese texto no parece un nombre de cliente.\n\nEscriba *solo el nombre o razón social* (ej: *Refacciones El Tigre*) o *cancelar* para cancelar el pedido." });
+                    return;
+                }
                 let clienteEncontrado = null;
                 if (vendedor) {
                     clienteEncontrado = await buscarClientePorNombreYVendedor(nombreCliente, vendedor.nombre);
@@ -3197,7 +3355,7 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                         const [debugRows] = await pool.execute("SELECT id_cliente, nombres, vendedor, activo FROM tab_clientes WHERE nombres LIKE ? LIMIT 5", [`%${nombreCliente}%`]);
                         console.log("[DEBUG_CLIENTE_MULTI] Búsqueda falló para:", nombreCliente, "Resultados LIKE:", JSON.stringify(debugRows));
                     } catch (de) { console.log("[DEBUG_CLIENTE] Error debug:", de.message); }
-                    await safeSendMessage(from, { text: `❌ No encontré un cliente llamado "*${nombreCliente}*".\n\nEscriba el nombre exacto o *cancelar* para cancelar el pedido.` });
+                    await safeSendMessage(from, { text: `❌ No encontré un cliente llamado "*${nombreCliente.substring(0, 40)}*".\n\nEscriba el nombre exacto o *cancelar* para cancelar el pedido.` });
                     return;
                 }
                 let gt = 0;
