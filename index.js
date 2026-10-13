@@ -224,6 +224,7 @@ const ia = require('./deepseek');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
+const BOT_VERSION = '2026-10-13.3-rif'; // Visible en /ping para confirmar qué versión está desplegada
 const PDF_URL_CATALOGO = process.env.PDF_URL_CATALOGO || 'https://www.one4cars.com/catalogo.pdf';
 
 // LISTA DE ADMINISTRADORES
@@ -2460,7 +2461,7 @@ async function startBot() {
         if (connection === 'open') { 
             botStarting = false;
             qrCodeData = "ONLINE ✅"; 
-            console.log("🚀 BOT MASTER ONLINE");
+            console.log(`🚀 BOT MASTER ONLINE (v${BOT_VERSION})`);
             if (!notificadorInterval) {
                 // MARCAR FACTURAS VIEJAS ANTES DE ACTIVAR NOTIFICADORES
                 await marcarFacturasViejasComoNotificadas();
@@ -2670,6 +2671,8 @@ async function startBot() {
                     await safeSendMessage(aj, { text: `🪪 *RIF RECIBIDO POR WHATSAPP*\nDe: ${nombreRif}\nTel: ${from.split('@')[0]}\nRIF: ${datosRif.rif || 'No detectado'}\nTitular: ${datosRif.nombre || 'No detectado'}\n\n_Imagen del RIF en el chat._` });
                 }
                 return;
+            } else if (textoOcr) {
+                console.log(`[OCR] Texto de imagen NO clasificado como RIF. Muestra: ${textoOcr.substring(0, 200)}`);
             }
 
             // --- 0a. COMANDOS DE IA (ADMIN) — se procesan primero para que no se confundan con productos/menú ---
@@ -4818,6 +4821,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             ok: true,
+            version: BOT_VERSION,
             bot: isBotReady() ? 'online' : 'offline',
             ia: ia.estaHabilitada() ? 'activa' : 'desactivada',
             procesos: procesosEstado,
