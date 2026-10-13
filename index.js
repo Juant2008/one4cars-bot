@@ -108,7 +108,9 @@ async function extraerTextoDeImagen(msg) {
                 mejorConfianza = confianza;
             }
             const palabras = palabrasLargasOcr(texto);
-            if ((confianza >= 75 && palabras >= 3) || palabras >= 8) break;
+            // Solo se corta antes si la lectura es inequívocamente buena
+            // (evita cortar con la basura de 0° antes de probar la imagen rotada)
+            if (palabras >= 12 || (confianza >= 85 && palabras >= 8)) break;
         }
 
         if (!ocrEsLegible(mejorTexto)) {
@@ -125,12 +127,18 @@ async function extraerTextoDeImagen(msg) {
 }
 
 // ===== DETECCIÓN DE DOCUMENTO RIF (SENIAT) =====
+// Tolerante a errores típicos del OCR (ej: "INFORNACION", "DOMICIUO", títulos partidos).
 function detectarComprobanteRif(texto) {
     if (!texto) return false;
     const t = texto.normalize("NFD").replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/\s+/g, ' ');
-    if (t.includes('REGISTRO UNICO DE INFORMACION FISCAL')) return true;
-    if (t.includes('SENIAT') && t.includes('RIF')) return true;
-    if (t.includes('DOMICILIO FISCAL') && t.includes('RIF')) return true;
+    if (t.includes('DOMICILIO FISCAL')) return true;
+    if (t.includes('TRIBUTOS INTERNOS')) return true;
+    if (t.includes('INFORMACION FISCAL')) return true;
+    if (t.includes('REGISTRO') && t.includes('FISCAL')) return true;
+    if (/\bFISCAL\b/.test(t) && /\bRIF\b/.test(t)) return true;
+    if (t.includes('SENIAT') && /(RIF|FISCAL|INFORMACION|TRIBUTOS)/.test(t)) return true;
+    // Fallback: número de RIF (V/J/E/G + 7-9 dígitos) junto a palabras fiscales
+    if (/\b[VJEG]\s*[-.]?\s*\d{7,9}\b/.test(t) && /(FISCAL|TRIBUTOS|SENIAT|INFORMACION|INSCRIPCION|VENCIMIENTO)/.test(t)) return true;
     return false;
 }
 
