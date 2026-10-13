@@ -31,10 +31,11 @@ async function reiniciarOcrWorker() {
     tesseractWorker = null;
 }
 
-async function preprocesarImagen(buffer, angulo = 0) {
+async function preprocesarImagen(buffer, angulo = 0, espejar = false) {
     try {
         let pipeline = sharp(buffer);
-        // Si la foto viene girada (ej: RIF de lado), se rota antes de leer
+        // Si la foto viene girada (ej: RIF de lado) o espejada (cámara frontal), se corrige antes de leer
+        if (espejar) pipeline = pipeline.flop();
         if (angulo) pipeline = pipeline.rotate(angulo);
         return await pipeline
             .resize({ width: 2000, withoutEnlargement: false })
@@ -86,33 +87,44 @@ async function extraerTextoDeImagen(msg) {
         let mejorConfianza = 0;
         let intentosSinTexto = 0;
 
-        // Se prueba 0°, 90°, 180° y 270° para corregir documentos fotografiados girados
-        for (const angulo of [0, 90, 180, 270]) {
-            const buffPre = await preprocesarImagen(buffer, angulo);
-            const { data } = await worker.recognize(buffPre);
-            const texto = (data.text || '').trim();
-            const confianza = data.confidence || 0;
+        // Se prueba cada orientación (0/90/180/270) y, si ninguna es buena, también la versión espejada
+        // (fotos tomadas con cámara frontal o del revés).
+        const orientaciones = [0, 90, 180, 270];
+        for (const espejar of [false, true]) {
+            for (const angulo of orientaciones) {
+                const buffPre = await preprocesarImagen(buffer, angulo, espejar);
+                const { data } = await worker.recognize(buffPre);
+                const texto = (data.text || '').trim();
+                const confianza = data.confidence || 0;
 
-            if (texto.replace(/\s/g, '').length < 12) {
-                intentosSinTexto++;
-                // Foto sin texto (ej: producto): 0° y 90° vacíos → no tiene sentido seguir rotando
-                if (intentosSinTexto >= 2) return null;
-                continue;
-            }
-            intentosSinTexto = 0;
+                if (texto.replace(/\s/g, '').length < 12) {
+                    intentosSinTexto++;
+                    // Foto sin texto (ej: producto): 0° y 90° vacíos → no tiene sentido seguir
+                    if (intentosSinTexto >= 2) return null;
+                    continue;
+                }
+                intentosSinTexto = 0;
 
-            const puntaje = puntuarOcr(texto, confianza);
-            if (puntaje > mejorPuntaje) {
-                mejorPuntaje = puntaje;
-                mejorTexto = texto;
-                mejorConfianza = confianza;
+                const puntaje = puntuarOcr(texto, confianza);
+                if (puntaje > mejorPuntaje) {
+                    mejorPuntaje = puntaje;
+                    mejorTexto = texto;
+                    mejorConfianza = confianza;
+                }
+                const palabras = palabrasLargasOcr(texto);
+                // La basura de una foto girada produce "palabras" largas falsas,
+                // así que solo se corta con lectura de ALTA confianza.
+                if (confianza >= 75 && palabras >= 8) break;
             }
-            const palabras = palabrasLargasOcr(texto);
-            // Solo se corta antes si la lectura es inequívocamente buena
-            // (evita cortar con la basura de 0° antes de probar la imagen rotada)
-            if (palabras >= 12 || (confianza >= 85 && palabras >= 8)) break;
+            // Si la primera tanda (rotaciones) ya dio lectura confiable, no probar espejadas
+            if (mejorConfianza >= 70) break;
         }
 
+        // Lectura con poca confianza = basura; no debe entrar al flujo de pedidos ni de nombres
+        if (mejorConfianza < 50) {
+            console.log(`[OCR] Lectura descartada por baja confianza (conf=${Number(mejorConfianza).toFixed(1)}): "${(mejorTexto || '').substring(0, 80)}"`);
+            return null;
+        }
         if (!ocrEsLegible(mejorTexto)) {
             console.log(`[OCR] Texto ilegible descartado (conf=${Number(mejorConfianza).toFixed(1)}): "${(mejorTexto || '').substring(0, 80)}"`);
             return null;
@@ -224,7 +236,7 @@ const ia = require('./deepseek');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
-const BOT_VERSION = '2026-10-13.3-rif'; // Visible en /ping para confirmar qué versión está desplegada
+const BOT_VERSION = '2026-10-13.4-ocr'; // Visible en /ping para confirmar qué versión está desplegada
 const PDF_URL_CATALOGO = process.env.PDF_URL_CATALOGO || 'https://www.one4cars.com/catalogo.pdf';
 
 // LISTA DE ADMINISTRADORES
