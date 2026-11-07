@@ -5313,7 +5313,7 @@ const server = http.createServer(async (req, res) => {
             qrCodeData = "Iniciando...";
             botStarting = false;
             programarReinicio(2000);
-            res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Sesión borrada</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><meta http-equiv="refresh" content="5;url=/"> </head><body class="bg-light"><div class="container mt-5 text-center"><div class="card shadow p-5 mx-auto" style="max-width:500px;border-radius:15px;"><h3>✅ Sesión borrada</h3><p class="mt-3">La carpeta <strong>auth_info</strong> se eliminó correctamente.</p><p>El bot mostrará un nuevo código QR en <strong>5 segundos</strong>.</p><a href="/" class="btn btn-primary mt-3">Ir al inicio</a></div></div></body></html>`);
+            res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Sesión borrada</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><meta http-equiv="refresh" content="5;url=/"> </head><body class="bg-light"><div class="container mt-5 text-center"><div class="card shadow p-5 mx-auto" style="max-width:500px;border-radius:15px;"><h3>✅ Sesión borrada</h3><p class="mt-3">La carpeta <strong>auth_info</strong> se eliminó correctamente.</p><p>El bot mostrará un nuevo código QR en <strong>5 segundos</strong>.</p><a href="/" class="btn btn-primary mt-3">Ir al inicio</a></div></div></body></html>`);
         } catch (e) { res.end("Error al borrar sesión: " + e.message); }
     } else if (routename === '/notificador-estado') {
 
@@ -5345,8 +5345,10 @@ const server = http.createServer(async (req, res) => {
         <html>
         <head>
             <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
             <title>Notificador</title>
+            <style>@media(max-width:820px){.table-responsive{overflow-x:auto;-webkit-overflow-scrolling:touch}.table-responsive table{min-width:720px}.table-responsive th,.table-responsive td{white-space:nowrap;font-size:.82rem}}</style>
         </head>
         <body class="bg-light">
             ${header}
@@ -5379,7 +5381,7 @@ const server = http.createServer(async (req, res) => {
     } else if (routename === '/historial') {
         const [msgs] = await pool.execute("SELECT h.id, h.telefono, h.rol, h.contenido, h.fecha FROM historial_chat h ORDER BY h.fecha DESC LIMIT 200");
         const rows = msgs.map(m => `<tr><td>${m.telefono}</td><td class="${m.rol === 'user' ? 'text-primary' : 'text-success'}">${m.rol}</td><td style="max-width:400px;word-break:break-word">${m.contenido}</td><td>${new Date(m.fecha).toLocaleString()}</td></tr>`).join('');
-        res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><title>Historial Chat</title></head><body class="bg-light">${header}<div class="container mt-3"><h3>💬 Historial de Conversaciones</h3><div class="table-responsive"><table class="table table-sm table-striped"><thead><tr><th>Teléfono</th><th>Rol</th><th>Mensaje</th><th>Fecha</th></tr></thead><tbody>${rows}</tbody></table></div><a href="/" class="btn btn-outline-secondary">Volver</a></div></body></html>`);
+        res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><title>Historial Chat</title><style>@media(max-width:820px){.table-responsive{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid #e5e7eb;border-radius:10px}.table-responsive table{min-width:640px}.table-responsive th,.table-responsive td{font-size:.82rem}.table-responsive td:nth-child(3){white-space:normal;min-width:220px}}</style></head><body class="bg-light">${header}<div class="container mt-3"><h3>💬 Historial de Conversaciones</h3><div class="table-responsive"><table class="table table-sm table-striped"><thead><tr><th>Teléfono</th><th>Rol</th><th>Mensaje</th><th>Fecha</th></tr></thead><tbody>${rows}</tbody></table></div><a href="/" class="btn btn-outline-secondary">Volver</a></div></body></html>`);
     } else if (routename === '/set-send-config' && req.method === 'POST') {
         let b = ''; req.on('data', c => b += c);
         req.on('end', () => {
@@ -5465,8 +5467,10 @@ const server = http.createServer(async (req, res) => {
         <html>
         <head>
             <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
             <title>Recordatorio Visitas</title>
+            <style>@media(max-width:820px){.table-responsive{overflow-x:auto;-webkit-overflow-scrolling:touch}.table-responsive table{min-width:720px}.table-responsive th,.table-responsive td{white-space:nowrap;font-size:.82rem}}</style>
         </head>
         <body class="bg-light">
             ${header}
@@ -5669,7 +5673,7 @@ const server = http.createServer(async (req, res) => {
         }
         const meses = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
 
-        res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"><title>Visitas Agendadas</title><style>body{background:#f4f7f6}.card-custom{border-radius:12px;border:none;box-shadow:0 2px 8px rgba(0,0,0,0.06)}@media print{body{background:#fff}.no-print,.no-print-table{display:none!important}.card-custom{box-shadow:none;border:1px solid #ddd}table{font-size:11px}td:first-child,th:first-child{display:none}}</style></head><body class="bg-light">${header}
+        res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"><title>Visitas Agendadas</title><style>body{background:#f4f7f6}.card-custom{border-radius:12px;border:none;box-shadow:0 2px 8px rgba(0,0,0,0.06)}@media print{body{background:#fff}.no-print,.no-print-table{display:none!important}.card-custom{box-shadow:none;border:1px solid #ddd}table{font-size:11px}td:first-child,th:first-child{display:none}}</style></head><body class="bg-light">${header}
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
         <div class="container-fluid px-4 mt-3">
         <h3>📅 Agenda de Visitas</h3>
@@ -5992,7 +5996,7 @@ const server = http.createServer(async (req, res) => {
             <td class="text-center">${d.dias_vencida}d</td>
             <td>${notifSet.has(d.id_cliente) ? '<span class="badge bg-success">✅</span>' : '<span class="badge bg-warning text-dark">⏳</span>'}</td>
         </tr>`).join('');
-        res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><title>Recordatorios de Pago</title><style>body{background:#f4f7f6}.card-custom{border-radius:15px;border:none;box-shadow:0 4px 12px rgba(0,0,0,0.08)}</style></head><body>${header}
+        res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><title>Recordatorios de Pago</title><style>body{background:#f4f7f6}.card-custom{border-radius:15px;border:none;box-shadow:0 4px 12px rgba(0,0,0,0.08)}@media(max-width:820px){.container-fluid{padding-left:.6rem!important;padding-right:.6rem!important}.table-responsive{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid #e5e7eb;border-radius:10px}.table-responsive table{min-width:760px;margin-bottom:0}.table-responsive th,.table-responsive td{white-space:nowrap;font-size:.8rem;padding:.35rem .45rem}.card-custom{padding:1rem!important}.btn-lg{font-size:1rem;padding:.5rem .9rem}h4{font-size:1.1rem}}</style></head><body>${header}
         <div class="container-fluid px-4 mt-3">
         ${query.error ? `<div class="alert alert-danger">❌ ${query.error}</div>` : ''}
         ${query.success ? `<div class="alert alert-success">✅ ${query.success}</div>` : ''}
@@ -6826,6 +6830,10 @@ body{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh
 .card-dash .btn{font-size:0.8rem;padding:0.4rem 0.75rem}
 .stat-box .num{font-size:1.2rem}
 .dolar-badge{font-size:0.7rem}
+.container{padding-left:.75rem!important;padding-right:.75rem!important}
+.table-responsive{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px}
+.table-responsive table{min-width:720px;font-size:.78rem}
+.table-responsive th,.table-responsive td{white-space:nowrap}
 }
 </style>
 </head>
