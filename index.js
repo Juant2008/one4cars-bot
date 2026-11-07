@@ -3175,6 +3175,12 @@ async function startBot() {
 
             // --- 0. BIENVENIDA PRIMERA VEZ + SALUDO ---
             if (!sesion) {
+                // Si el primer mensaje es interés mayorista, no dar la bienvenida
+                // genérica: enviar de inmediato el registro de empresa.
+                if (!isAdmin && detectarInteresMayorista(rawText)) {
+                    const manejado = await enviarRegistroMayorista(from, pushName, rawText, null);
+                    if (manejado) return;
+                }
                 const esPregunta = rawText.includes('?') ||
                     /\b(tienen|tiene|cuentan|cuenta con|puedo ver|pasame|pas[aá]me|env[ií]eme|env[ií]ame|compart[aá]me|mandame|m[aá]ndame|me pueden|me podr[ií]an|cu[aá]les|cu[aá]l|d[oó]nde|donde|favor)\b/i.test(rawText);
                 const mencionaCatalogo = /cat[aá]logo/i.test(rawText);
