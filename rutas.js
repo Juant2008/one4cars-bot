@@ -40,7 +40,8 @@ async function rankingZonas(limite = 5) {
             const enMora = Number(z.en_mora) || 0;
             const saldo = Number(z.saldo_mora) || 0;
             const frios = Number(z.frios) || 0;
-            const score = clientes * 1 + enMora * 5 + frios * 2 + Math.min(saldo / 1000, 15);
+            // La cobranza pesa mucho más que la reactivación.
+            const score = clientes * 1 + enMora * 8 + Math.min(saldo / 500, 30) + frios * 1;
             return { zona: z.zona, clientes, enMora, saldo, frios, score: Math.round(score * 10) / 10 };
         });
         zonas.sort((a, b) => b.score - a.score);
@@ -103,10 +104,17 @@ async function buscarZona(term) {
     } catch (e) { return null; }
 }
 
-async function textoRuta() {
-    const ranking = await rankingZonas(5);
+const sesiones = new Map(); // telefono -> { zonas: [...], i: 0 }
+
+function tieneSesion(telefono) {
+    return sesiones.has(String(telefono || ''));
+}
+
+async function textoRuta(telefono) {
+    const ranking = await rankingZonas(10);
     if (!ranking.length) return 'No encontré zonas con clientes activos.';
-    let msg = `🗺️ *RUTA RECOMENDADA DE HOY*\n_Combina concentración de clientes, cobranza vencida y reactivación._\n\n`;
+    sesiones.set(String(telefono || ''), { zonas: ranking.map(z => z.zona), i: 0 });
+    let msg = `🗺️ *RUTA RECOMENDADA DE HOY*\n_Prioriza cobranza vencida y concentración de clientes._\n\n`;
 
     const top = ranking[0];
     const detalle = await detalleZona(top.zona, 8);
@@ -128,15 +136,28 @@ async function textoRuta() {
         msg += `\n`;
     }
 
-    const otras = ranking.slice(1);
+    const otras = ranking.slice(1, 6);
     if (otras.length) {
         msg += `📌 *Otras zonas con potencial:*\n`;
         otras.forEach((z, i) => {
             msg += `${i + 2}. *${z.zona}* — ${z.clientes} clientes · ${z.enMora} en mora ($${money(z.saldo)}) · ${z.frios} fríos\n`;
         });
     }
-    msg += `\nPara ver una zona en detalle: *ruta ${ranking[1] ? ranking[1].zona : top.zona}*`;
+    msg += `\nSi esa zona no te sirve (tráfico, etc.): *otra opción*\nPara ver una zona en detalle: *ruta ${ranking[1] ? ranking[1].zona : top.zona}*`;
     return msg;
+}
+
+async function otraRuta(telefono) {
+    const key = String(telefono || '');
+    const st = sesiones.get(key);
+    if (!st) return textoRuta(telefono);
+    if (st.i + 1 >= st.zonas.length) {
+        return 'Ya te mostré todas las zonas con potencial. Escríbeme *ruta NOMBRE DE ZONA* para ver una en específico.';
+    }
+    st.i++;
+    const zona = st.zonas[st.i];
+    const txt = await textoZona(zona);
+    return `🔁 *Otra opción (${st.i + 1}/${st.zonas.length})*\n\n${txt}`;
 }
 
 async function textoZona(term) {
@@ -159,4 +180,4 @@ async function textoZona(term) {
     return msg.trim();
 }
 
-module.exports = { init, rankingZonas, detalleZona, textoRuta, textoZona, buscarZona };
+module.exports = { init, rankingZonas, detalleZona, textoRuta, textoZona, buscarZona, otraRuta, tieneSesion };

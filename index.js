@@ -1285,7 +1285,14 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
     if (isAdmin) {
         // 1z) Ruta de venta del día
         if (/(?:a\s+d[oó]nde\s+(?:deber[ií]a\s+|debo\s+|me\s+conviene\s+)?(?:vender|ir|visitar)|qu[eé]\s+zona[s]?\s+(?:deber[ií]a\s+|debo\s+)?(?:vender|visitar|atender)|ruta\s+(?:de\s+)?(?:hoy|del\s+d[ií]a|de\s+ventas|de\s+visitas)|plan\s+de\s+(?:ventas|visitas)|d[oó]nde\s+vendo\s+hoy|d[oó]nde\s+vender\s+hoy)/i.test(t)) {
-            await safeSendMessage(from, { text: await rutas.textoRuta() });
+            await safeSendMessage(from, { text: await rutas.textoRuta(from) });
+            return true;
+        }
+        // Otra opción de ruta (si la anterior no sirve por tráfico, etc.)
+        if (rutas.tieneSesion(from) && (/^(?:dame\s+)?(?:otra|siguiente)\b/i.test(t) ||
+            /^(?:otra|siguiente)\s+(?:opci[oó]n|zona|ruta)\b/i.test(t) ||
+            /^(?:no\s+me\s+(?:gusta|sirve)|esa\s+no|otra\s+por\s+favor|hay\s+mucho\s+tr[aá]fico)/i.test(t))) {
+            await safeSendMessage(from, { text: await rutas.otraRuta(from) });
             return true;
         }
         const mZona = t.match(/^ruta\s+(?!de\s+hoy\b|del\s+d[ií]a\b|hoy\b|de\s+ventas\b|de\s+visitas\b)(.+)$/i);
@@ -6187,6 +6194,11 @@ const server = http.createServer(async (req, res) => {
         }));
     } else if (routename === '/test-ruta') {
         try {
+            if (query.otra === '1') {
+                const texto = await rutas.otraRuta('test');
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: true, texto }, null, 2));
+            }
             if (query.zona) {
                 const txt = await rutas.textoZona(query.zona);
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
