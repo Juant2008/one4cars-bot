@@ -3394,9 +3394,12 @@ async function startBot() {
             }
 
             // --- 1c. INTERÉS MAYORISTA / REGISTRO DE EMPRESA ---
-            if (!isAdmin && detectarInteresMayorista(rawText) && !parecePedidoOperativo(rawText)) {
-                const manejado = await enviarRegistroMayorista(from, pushName, rawText, sesion);
-                if (manejado) return;
+            if (!isAdmin && detectarInteresMayorista(rawText)) {
+                const yaCliente = await esClienteRegistrado(from, sesion);
+                if (!yaCliente) {
+                    const manejado = await enviarRegistroMayorista(from, pushName, rawText, sesion);
+                    if (manejado) return;
+                }
             }
 
             // --- 1d. ENRUTADOR IA: lenguaje natural bajo parámetros ---
@@ -5429,6 +5432,34 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-mayorista') {
+        try {
+            const from = query.from || '584140000000@s.whatsapp.net';
+            const texto = query.texto || 'estoy interesado en sus productos';
+            const sesion = await getSesion(from);
+            const interes = detectarInteresMayorista(texto);
+            const cliente = await esClienteRegistrado(from, sesion);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                from, texto, interes, cliente,
+                respuesta: cliente
+                    ? '✅ Su empresa ya está registrada. Se le ofrece catálogo/precios.'
+                    : TEXTO_REGISTRO_MAYORISTA
+            }, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-reencuentro') {
+        try {
+            const from = query.from || 'test-reencuentro@s.whatsapp.net';
+            const r = await detectarReencuentroMaster(from);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ from, reencuentro: r }, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }, null, 2));
+        }
     } else if (routename === '/test-reporte') {
         try {
             const pregunta = query.texto || '';
