@@ -118,6 +118,14 @@
       "respuesta": "💵 Consultando las tasas oficiales del día..."
     },
     {
+      "id": "registro_mayorista",
+      "titulo": "Registro de cliente mayorista",
+      "tipo": "mayorista",
+      "descripcion": "Cuando alguien muestra interés en comprar al mayor y no es cliente registrado, explica el registro de empresa y el mínimo de USD 100. Si ya es cliente, ofrécele catálogo y pedidos.",
+      "ejemplos": ["estoy interesado en sus productos", "estoy interesado en comprar al mayor", "me interesan sus productos", "me interesa comprar al mayor", "quiero comprar al mayor", "comprar al por mayor", "compra mayorista", "precios mayoristas", "soy una tienda", "tengo un negocio", "tengo un local", "quiero ser distribuidor", "soy distribuidor", "vendo repuestos y quiero comprar", "quiero registrarme como cliente", "precios al mayor"],
+      "respuesta": "🏢 *REGISTRO DE CLIENTE MAYORISTA ONE4CARS*\n\nGracias por su interés en nuestros productos. Trabajamos exclusivamente al mayor, con una compra mínima de *USD 100*.\n\nPara registrar su empresa necesitamos:\n1. Copia del RIF de la empresa.\n2. Foto del local.\n3. Dirección fiscal.\n4. Nombre del dueño.\n\nPuede enviar estos datos por este chat o completar el registro aquí:\nhttps://www.one4cars.com/afiliar_clientes.php/\n\nUn asesor validará su información y le activará la cuenta."
+    },
+    {
       "id": "saludo",
       "titulo": "Saludo institucional",
       "tipo": "respuesta",

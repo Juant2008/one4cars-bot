@@ -3,3 +3,4 @@ node_modules/
 deepseek_key.txt
 .env
 ai_decisions.jsonl
+reportes_ia.log

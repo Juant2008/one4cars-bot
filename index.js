@@ -217,11 +217,12 @@ function variantesCodigoOcr(codigo) {
 }
 
 // CAPTURA GLOBAL DE ERRORES EVITA QUE EL BOT MUERA
+let restartTimer = null;
 process.on('unhandledRejection', (err) => {
     const msg = err?.message || err;
     console.log("[UNHANDLED] Error no capturado:", msg);
     if (msg === "Connection Closed" && socketBot) {
-        setTimeout(() => startBot(), 3000);
+        programarReinicio(3000);
     }
 });
 process.on('uncaughtException', (err) => {
@@ -234,9 +235,15 @@ const marketingModulo = require('./marketing');
 const notificador = require('./notificador_local');
 const ia = require('./deepseek');
 const aiRouter = require('./ai_router');
+const catalogoTecnico = require('./catalogo_tecnico');
+const reportesIA = require('./reportes_ia');
+const licencia = require('./licencia');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
+const AUTH_DIR = path.join(__dirname, 'auth_info');
+const HIST_MSGS = Math.min(40, Math.max(6, parseInt(process.env.HISTORIAL_MSG || '40', 10) || 40));
+const REENCUENTRO_HORAS = Math.max(1, parseInt(process.env.REENCUENTRO_HORAS || '8', 10) || 8);
 const BOT_VERSION = '2026-11-07.1-rodi-ai'; // Visible en /ping para confirmar qué versión está desplegada
 const PDF_URL_CATALOGO = process.env.PDF_URL_CATALOGO || 'https://www.one4cars.com/catalogo.pdf';
 
@@ -252,6 +259,9 @@ const pool = mysql.createPool({
     queueLimit: 0,
     charset: 'UTF8_SPANISH_CI'
 });
+catalogoTecnico.init(pool);
+reportesIA.init(pool);
+licencia.init(pool);
 const poolLocal = mysql.createPool({
     host: process.env.LOCAL_DB_HOST || '127.0.0.1',
     user: process.env.LOCAL_DB_USER || process.env.DB_USER || 'juant200_one4car',
@@ -359,6 +369,9 @@ const MENU_INTENTIONS = {
 };
 
 let qrCodeData = "Iniciando...";
+let qrGeneratedAt = null;
+let pairingCodeData = null;
+let pairingPhone = null;
 let socketBot = null;
 let botStarting = false; // Mutex para evitar llamadas concurrentes a startBot()
 let dolarInfo = { bcv: 'Cargando...', paralelo: 'Cargando...', binance: 'Cargando...' };
@@ -372,6 +385,7 @@ const pendienteFactura = new Map();
 const lastFallbackSent = new Map();
 const FALLBACK_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutos
 const lastMessageTimes = new Map(); // Evitar respuestas duplicadas
+const licenciaAvisos = new Map(); // Evitar spam cuando la licencia está inactiva
 const DUPLICATE_COOLDOWN_MS = 10000; // 10 segundos
 
 // Frases de auto-respuesta automática de clientes (mensajes de bienvenida/auto-reply) que deben ignorarse
@@ -531,6 +545,37 @@ function normalizar(texto) {
         .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?!]/g, "") 
         .toLowerCase()
         .trim();
+}
+
+// Traducción de jerga técnica venezolana al término del catálogo.
+const JERGA_TECNICA = {
+    'munon': 'rotula', 'munones': 'rotula', 'muñon': 'rotula', 'muñones': 'rotula',
+    'croche': 'embrague', 'croché': 'embrague', 'cloche': 'embrague', 'clutch': 'embrague',
+    'sapito': 'bomba freno', 'sapitos': 'bomba freno', 'sapos': 'bomba freno',
+    'cruceta': 'cruz', 'crucetas': 'cruz',
+    'chumacera': 'soporte', 'chumaceras': 'soporte',
+    'casquete': 'buje', 'casquetes': 'buje',
+    'guaya': 'cable', 'guayas': 'cable',
+    'campana': 'puerta', 'campanas': 'puerta',
+    'parrilla': 'grille', 'parrillas': 'grille',
+    'tablero': 'salpicadero',
+    'balata': 'pastilla', 'balatas': 'pastillas',
+    'pastilla': 'pastillas', 'pastillas': 'pastillas',
+    'bomba de gasolina': 'bomba gasolina',
+    'bomba de agua': 'bomba agua',
+    'bomba de aceite': 'bomba aceite',
+    'caja': 'transmision', 'cajita': 'transmision'
+};
+
+function traducirJerga(texto) {
+    const palabras = String(texto || '').split(/\s+/);
+    const out = [];
+    for (const p of palabras) {
+        const key = normalizar(p);
+        const trad = JERGA_TECNICA[key];
+        out.push(trad || p);
+    }
+    return out.join(' ');
 }
 
 function extraerNombreDeSaludo(rawText) {
@@ -1039,6 +1084,79 @@ async function buscarClientePorTelefono(tel) {
     } catch (e) { return null; }
 }
 
+// ===== CLIENTES MAYORISTAS: REGISTRO Y CONTROL =====
+function detectarInteresMayorista(texto) {
+    const t = normalizar(texto);
+    return /(me interesa|me interesan|estoy interesad|interesado en (sus|los) productos|quiero comprar|comprar al mayor|comprar al por mayor|compra al mayor|compra mayorista|precios mayoristas|vender al mayor|quiero ser distribuidor|quiero distribuir|soy distribuidor|distribuidor mayorista|soy (una )?tienda|tengo (un )?negocio|tengo (un )?local|vendo repuestos|compro repuestos|comprar para (mi|un) negocio|comprar para revender|quiero ser cliente|afiliar|registrar mi (empresa|negocio|tienda)|comprar por mayor|precios al mayor)/.test(t);
+}
+
+async function esClienteRegistrado(from, sesion) {
+    if (sesion === true) return true;
+    if (sesion && sesion.id_cliente_int) return true;
+    if (sesion && sesion.usuario) {
+        try {
+            const c = await buscarCliente(sesion.usuario);
+            if (c) return true;
+        } catch (e) {}
+    }
+    const tel = String(from || '').split('@')[0].replace(/\D/g, '');
+    if (!tel) return false;
+    const c = await buscarClientePorTelefono(tel);
+    return !!c;
+}
+
+async function guardarLeadMayorista(from, nombre, mensaje) {
+    try {
+        await pool.execute(
+            "INSERT INTO bot_leads (telefono, nombre, mensaje) VALUES (?, ?, ?)",
+            [String(from || '').split('@')[0], String(nombre || '').slice(0, 200), String(mensaje || '').slice(0, 1000)]
+        );
+    } catch (e) { console.log('[LEAD] Error guardando lead:', e.message); }
+}
+
+async function notificarLeadMayorista(from, nombre, mensaje) {
+    try {
+        const adminJids = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
+        for (const aj of adminJids) {
+            await safeSendMessage(aj, { text: `🆕 *NUEVO INTERESADO MAYORISTA*\n\nNombre: ${nombre || 'No identificado'}\nTeléfono: ${String(from || '').split('@')[0]}\nMensaje: ${String(mensaje || '').slice(0, 300)}\n\nRevise el registro en el panel o en la tabla bot_leads.` });
+        }
+    } catch (e) {}
+}
+
+const TEXTO_REGISTRO_MAYORISTA = `🏢 *REGISTRO DE CLIENTE MAYORISTA ONE4CARS*\n\nGracias por su interés en nuestros productos. Trabajamos exclusivamente al mayor, con una compra mínima de *USD 100*.\n\nPara registrar su empresa necesitamos:\n1. Copia del RIF de la empresa.\n2. Foto del local.\n3. Dirección fiscal.\n4. Nombre del dueño.\n\nPuede enviar estos datos por este chat o completar el registro aquí:\nhttps://www.one4cars.com/afiliar_clientes.php/\n\nUn asesor validará su información y le activará la cuenta. Si lo desea, indíqueme el nombre de su empresa y qué productos necesita.`;
+
+async function enviarRegistroMayorista(from, pushName, rawText, sesion) {
+    if (await esClienteRegistrado(from, sesion)) {
+        await responderRouter(from, '✅ Su empresa ya está registrada con nosotros. Puedo ayudarle con el catálogo, precios, disponibilidad y pedidos al mayor. ¿Qué producto necesita?');
+        return true;
+    }
+    await responderRouter(from, TEXTO_REGISTRO_MAYORISTA);
+    await guardarLeadMayorista(from, pushName, rawText);
+    await notificarLeadMayorista(from, pushName, rawText);
+    return true;
+}
+
+// Reencuentro: si el cliente vuelve después de N horas, saludarlo y recordarle
+// el tema de la última conversación. Se apoya en el historial persistente.
+async function detectarReencuentroMaster(from) {
+    try {
+        const [r] = await pool.execute(
+            `SELECT TIMESTAMPDIFF(SECOND, MAX(fecha), NOW()) AS seg, MAX(fecha) AS fecha
+             FROM historial_chat
+             WHERE telefono = ? AND id < (SELECT MAX(id) FROM historial_chat WHERE telefono = ?)`,
+            [from, from]
+        );
+        const seg = r[0] && r[0].seg;
+        if (seg === null || seg === undefined || Number(seg) < REENCUENTRO_HORAS * 3600) return null;
+        const [msgs] = await pool.execute(
+            "SELECT contenido FROM historial_chat WHERE telefono = ? AND rol = 'user' ORDER BY id DESC LIMIT 6",
+            [from]
+        );
+        const resumen = msgs.reverse().map(m => String(m.contenido || '').trim()).filter(Boolean).join(' | ').slice(0, 220);
+        return { seg: Number(seg), fecha: r[0].fecha, resumen };
+    } catch (e) { return null; }
+}
+
 // ===== VERIFICACIÓN DE CRÉDITO DEL CLIENTE =====
 
 function extraerNombreCliente(rawText, itemsPedido) {
@@ -1356,6 +1474,27 @@ async function initDB() {
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
         try { await pool.execute("ALTER TABLE control_chat ADD COLUMN datos TEXT DEFAULT NULL AFTER modo"); } catch (e) {}
+
+        await pool.execute(`CREATE TABLE IF NOT EXISTS bot_leads (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            telefono VARCHAR(100),
+            nombre VARCHAR(200),
+            mensaje TEXT,
+            estado VARCHAR(30) DEFAULT 'nuevo',
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_lead_tel (telefono),
+            INDEX idx_lead_estado (estado)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
+        
+        await pool.execute(`CREATE TABLE IF NOT EXISTS bot_licencia (
+            id INT PRIMARY KEY DEFAULT 1,
+            estado VARCHAR(20) NOT NULL DEFAULT 'activa',
+            fecha_expiracion DATE NULL,
+            token VARCHAR(120) NULL,
+            notas VARCHAR(255) NULL,
+            actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
+        try { await pool.execute("INSERT IGNORE INTO bot_licencia (id, estado, fecha_expiracion) VALUES (1, 'activa', '2099-12-31')"); } catch (e) {}
         
         await pool.execute(`CREATE TABLE IF NOT EXISTS historial_chat (
             id INT AUTO_INCREMENT PRIMARY KEY, 
@@ -1929,18 +2068,88 @@ function parecePedidoOperativo(rawText) {
     return false;
 }
 
+function stockTexto(p) {
+    const stock = parseFloat(p.stock_total || 0);
+    const fab = parseFloat(p.cantidad_fabricando || 0);
+    if (stock > 0) return '✅ Disponible';
+    if (fab > 0) return '🚚 En tránsito desde fábrica';
+    return '⏳ Bajo confirmación';
+}
+
+function notaCompat(prods) {
+    const baja = (prods || []).some(p => p.confianza !== undefined && parseFloat(p.confianza) < 0.9);
+    return baja ? '\n\n⚠️ *Nota:* algunas referencias son compatibilidades referenciales. Un asesor confirma el calce exacto antes de comprar.' : '';
+}
+
+async function enviarResultadosCompatibles(from, r) {
+    const prods = (r && r.productos) ? r.productos : [];
+    if (!prods.length) {
+        if (r && r.mensaje) { await responderRouter(from, r.mensaje); return true; }
+        return false;
+    }
+    const pct = await obtenerPorcentaje();
+    if (prods.length > 1) {
+        let msg = `${r.mensaje || '🔎 *Resultados compatibles*'}\n\n`;
+        prods.slice(0, 8).forEach((p, i) => {
+            const precio = parseFloat(p.precio_minimo || 0) / pct;
+            const precioTxt = precio > 0 ? `*$${precio.toFixed(2)}*` : '*Precio a confirmar*';
+            msg += `*${i + 1}.* ${p.producto} — ${precioTxt} ${stockTexto(p)}\n   ${String(p.descripcion || '').slice(0, 80)}\n`;
+        });
+        if (r.mensaje && /ind[ií]queme|indique/i.test(r.mensaje)) msg += `\n${r.mensaje}`;
+        msg += notaCompat(prods);
+        msg += `\n\nResponda el *número* del producto que necesita.`;
+        pendingProductSelection.set(from, { productos: prods.slice(0, 8), pct });
+        return await responderRouter(from, msg);
+    }
+    const p = prods[0];
+    const precio = parseFloat(p.precio_minimo || 0) / pct;
+    const precioTxt = precio > 0 ? `$${precio.toFixed(2)}` : 'Precio a confirmar';
+    const header = r.mensaje ? `${r.mensaje}\n\n` : '';
+    const caption = `${header}📦 *${p.producto}*\n💰 *Precio: ${precioTxt}*${precio > 0 ? ' (pagadero a tasa BCV)' : ''}\n${stockTexto(p)}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}${notaCompat([p])}`;
+    try {
+        if (!isBotReady()) throw new Error('socket no listo');
+        registrarEnvioBot(from, caption);
+        await socketBot.sendMessage(from, { image: { url: `https://one4cars.com/imagen/${p.producto}.jpg` }, caption });
+    } catch (e) {
+        await safeSendMessage(from, { text: caption });
+    }
+    try { await guardarMensaje(from, 'model', caption); } catch (e) {}
+    return true;
+}
+
 async function responderProductosIA(from, busqueda) {
     const consulta = String(busqueda || '').trim();
     if (!consulta) {
         return await responderRouter(from, '🔎 Indíqueme la pieza que busca y, si aplica, marca, modelo y año del vehículo. Así puedo confirmar precio y disponibilidad.');
     }
     let prods = null;
+    // 1) Código OEM / equivalencia
+    try {
+        const oem = await catalogoTecnico.buscarPorOEM(consulta);
+        if (oem && oem.productos && oem.productos.length) {
+            return await enviarResultadosCompatibles(from, {
+                productos: oem.productos,
+                mensaje: `🔎 *Código ${oem.codigos.join(', ')}*`
+            });
+        }
+    } catch (e) { console.log('[CATALOGO] OEM:', e.message); }
+
+    // 2) Compatibilidad vehículo ↔ pieza
+    try {
+        const compat = await catalogoTecnico.buscarCompatibles(consulta);
+        if (compat) {
+            const manejado = await enviarResultadosCompatibles(from, compat);
+            if (manejado) return true;
+        }
+    } catch (e) { console.log('[CATALOGO] Compatibilidad:', e.message); }
+
+    const consultaBusqueda = traducirJerga(consulta);
     const posibleCodigo = consulta.replace(/[^A-Za-z0-9-]/g, '');
     if (posibleCodigo.length >= 4 && /\d/.test(posibleCodigo) && /[A-Za-z]/.test(posibleCodigo)) {
         try { prods = await buscarProductoPorCodigo(posibleCodigo); } catch (e) {}
     }
     if (!prods || !prods.length) {
-        try { prods = await buscarProductoPorTexto(consulta); } catch (e) {}
+        try { prods = await buscarProductoPorTexto(consultaBusqueda); } catch (e) {}
     }
     if (!prods || !prods.length) {
         return await responderRouter(from, `No encontré una coincidencia exacta para "*${consulta.slice(0, 80)}*" en el inventario.\n\nPara confirmar precio y disponibilidad, indíqueme:\n• Pieza\n• Marca, modelo y año del vehículo\n• Cantidad\n\nTambién puede consultar el catálogo: https://www.one4cars.com/consulta_productos.php/`);
@@ -2020,6 +2229,8 @@ async function ejecutarAccionRouter(decision, ctx) {
         }
         case 'producto':
             return await responderProductosIA(from, (decision.parametros && decision.parametros.busqueda) || ctx.rawText);
+        case 'mayorista':
+            return await enviarRegistroMayorista(from, ctx.pushName, ctx.rawText, ctx.sesionValidada);
         case 'pedido':
             return await responderRouter(from, accion.respuesta || texto || '');
         case 'asesor': {
@@ -2578,6 +2789,14 @@ async function guardarComandosBD(texto) {
 }
 
 // ===== BOT WHATSAPP =====
+function programarReinicio(ms) {
+    if (restartTimer) clearTimeout(restartTimer);
+    restartTimer = setTimeout(() => {
+        restartTimer = null;
+        startBot();
+    }, ms);
+}
+
 async function startBot() {
     if (botStarting) {
         console.log("[BOT] ⏳ Ya hay un intento de conexión en curso, omitiendo...");
@@ -2595,7 +2814,7 @@ async function startBot() {
 
     try {
         // Asegurar que el directorio auth_info exista antes de intentar leer
-        const authDir = path.join(process.cwd(), 'auth_info');
+        const authDir = AUTH_DIR;
         if (!fs.existsSync(authDir)) {
             fs.mkdirSync(authDir, { recursive: true });
             console.log("[BOT] 📁 Directorio auth_info creado.");
@@ -2606,7 +2825,8 @@ async function startBot() {
 
     let state, saveCreds;
     try {
-        const auth = await useMultiFileAuthState('auth_info');
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+        const auth = await useMultiFileAuthState(AUTH_DIR);
         state = auth.state;
         saveCreds = auth.saveCreds;
     } catch (e) {
@@ -2614,12 +2834,11 @@ async function startBot() {
         console.log("[BOT] 🔄 Limpiando auth_info y reiniciando...");
         botStarting = false;
         try {
-            const authDir = path.join(process.cwd(), 'auth_info');
-            if (fs.existsSync(authDir)) {
-                fs.rmSync(authDir, { recursive: true, force: true });
+            if (fs.existsSync(AUTH_DIR)) {
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             }
         } catch (e) {}
-        setTimeout(() => startBot(), 5000);
+        programarReinicio(5000);
         return;
     }
 
@@ -2634,14 +2853,36 @@ async function startBot() {
     });
 
     socketBot = sock;
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+        try {
+            await saveCreds();
+        } catch (e) {
+            if (e && e.code === 'ENOENT') {
+                try {
+                    fs.mkdirSync(AUTH_DIR, { recursive: true });
+                    await saveCreds();
+                    console.log('[BOT] auth_info recreado y credenciales guardadas.');
+                } catch (e2) {
+                    console.log('[BOT] Error guardando credenciales:', e2.message);
+                }
+            } else {
+                console.log('[BOT] Error guardando credenciales:', e.message);
+            }
+        }
+    });
 
     sock.ev.on('connection.update', async (u) => {
         const { connection, lastDisconnect, qr } = u;
-        if (qr) qrcode.toDataURL(qr, { scale: 10 }, (_, url) => qrCodeData = url);
+        if (qr) {
+            qrGeneratedAt = new Date();
+            console.log(`[BOT] QR generado (${qrGeneratedAt.toISOString()})`);
+            qrcode.toDataURL(qr, { scale: 10 }, (_, url) => qrCodeData = url);
+        }
+        if (connection) console.log(`[BOT] Estado de conexión: ${connection}`);
         if (connection === 'open') { 
             botStarting = false;
-            qrCodeData = "ONLINE ✅"; 
+            qrCodeData = "ONLINE ✅";
+            pairingCodeData = null;
             console.log(`🚀 BOT MASTER ONLINE (v${BOT_VERSION})`);
             if (!notificadorInterval) {
                 // MARCAR FACTURAS VIEJAS ANTES DE ACTIVAR NOTIFICADORES
@@ -2670,19 +2911,18 @@ async function startBot() {
             const errorMsg = lastDisconnect?.error?.message || '';
             const esLoggedOut = statusCode === DisconnectReason.loggedOut;
             const esBadSession = errorMsg.includes('Bad MAC') || errorMsg.includes('Unsupported state') || errorMsg.includes('unable to authenticate');
-            if (esBadSession) {
+            const credsPath = path.join(AUTH_DIR, 'creds.json');
+            console.log(`[BOT] Conexión cerrada. status=${statusCode || '?'} loggedOut=${esLoggedOut} badSession=${esBadSession} msg=${errorMsg || 'sin detalle'}`);
+            if (esBadSession && fs.existsSync(credsPath)) {
                 console.log("[BOT] Sesión corrupta, limpiando auth_info y generando nuevo QR...");
                 try {
-                    const authDir = path.join(process.cwd(), 'auth_info');
-                    if (fs.existsSync(authDir)) {
-                        fs.rmSync(authDir, { recursive: true, force: true });
-                    }
+                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 } catch (e) {}
                 qrCodeData = "Iniciando...";
             }
             if (!esLoggedOut) {
                 const delay = esBadSession ? 10000 : 5000;
-                setTimeout(() => startBot(), delay);
+                programarReinicio(delay);
             }
         }
     });
@@ -2728,6 +2968,16 @@ async function startBot() {
 
             const isAdmin = ADMIN_IDS.some(id => from.includes(id));
             const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
+
+            if (!licencia.estaActiva() && !isAdmin) {
+                const ahoraLic = Date.now();
+                const ultimoLic = licenciaAvisos.get(from) || 0;
+                if (ahoraLic - ultimoLic > 10 * 60 * 1000) {
+                    licenciaAvisos.set(from, ahoraLic);
+                    await safeSendMessage(from, { text: '🔧 *ONE4CARS*\n\nEstamos realizando una actualización programada. Un asesor le atenderá en breve. Gracias por su paciencia.' });
+                }
+                return;
+            }
 
             const pushName = msg.pushName || "Usuario";
             let rawText = (msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || "").trim();
@@ -2884,6 +3134,42 @@ async function startBot() {
                         return await safeSendMessage(from, { text: `🤖 IA DeepSeek: ${ia.estaHabilitada() ? '🟢 Activa' : '🔴 Desactivada'}.\n\nNo pude consultar el saldo. Verifique que DEEPSEEK_API_KEY esté configurada en el servidor.` });
                     }
                     return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n💵 Saldo disponible: *$${saldo.saldo.toFixed(2)} USD*\n${saldo.disponible ? '🟢 La IA puede responder.' : '🔴 Saldo agotado: el bot responde en modo clásico.'}` });
+                }
+            }
+
+            // --- 0a1. LICENCIA / CONTROL (ADMIN) ---
+            if (isAdmin && (text === 'licencia' || text.startsWith('licencia '))) {
+                try {
+                    if (text === 'licencia') {
+                        const e = await licencia.verificar(true);
+                        return await safeSendMessage(from, { text: `🔐 *LICENCIA ONE4CARS*\n\nEstado: *${e.activa ? 'ACTIVA' : 'INACTIVA'}*\nLicencia: ${e.estado || 'activa'}\nVence: ${e.fecha_expiracion ? String(e.fecha_expiracion).slice(0, 10) : 'sin fecha'}\nMotivo: ${e.motivo || '—'}` });
+                    }
+                    if (text.startsWith('licencia activar')) {
+                        const e = await licencia.setEstado('activa');
+                        return await safeSendMessage(from, { text: `✅ Licencia activada. Estado: ${e.activa ? 'ACTIVA' : 'INACTIVA'}.` });
+                    }
+                    if (text.startsWith('licencia desactivar') || text.startsWith('licencia suspender')) {
+                        const e = await licencia.setEstado('inactiva');
+                        return await safeSendMessage(from, { text: `⛔ Licencia desactivada. El bot quedará en mantenimiento para clientes. Estado: ${e.activa ? 'ACTIVA' : 'INACTIVA'}.` });
+                    }
+                    const mVence = rawText.match(/licencia\s+vence\s+(\d{4}-\d{2}-\d{2})/i);
+                    if (mVence) {
+                        const e = await licencia.setEstado('activa', mVence[1]);
+                        return await safeSendMessage(from, { text: `✅ Licencia activa hasta *${mVence[1]}*.` });
+                    }
+                    return await safeSendMessage(from, { text: 'Uso: *licencia*, *licencia activar*, *licencia desactivar* o *licencia vence 2026-12-31*.' });
+                } catch (e) {
+                    return await safeSendMessage(from, { text: `❌ Error de licencia: ${e.message}` });
+                }
+            }
+
+            // --- 0a2. REPORTES IA EN LENGUAJE NATURAL (ADMIN) ---
+            if (isAdmin && (text.startsWith('reporte ') || text.startsWith('pregunta '))) {
+                const pregunta = rawText.replace(/^(reporte|pregunta)\s+/i, '').trim();
+                if (pregunta) {
+                    await safeSendMessage(from, { text: '📊 Consultando los datos...' });
+                    const respuesta = await reportesIA.preguntar(pregunta);
+                    return await safeSendMessage(from, { text: respuesta });
                 }
             }
 
@@ -3090,6 +3376,29 @@ async function startBot() {
                 }
             }
 
+            // --- 1b2. REENCUENTRO DESPUÉS DE 8 HORAS ---
+            const esSaludoTexto = /^(hola|buen|menu|menú|saludo|que tal)/.test(text);
+            if (!isAdmin && !esSaludoTexto && !/^\d+$/.test(text)) {
+                const reenc = await detectarReencuentroMaster(from);
+                if (reenc) {
+                    const nombreReenc = nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || 'estimado';
+                    let fechaReenc = '';
+                    try {
+                        fechaReenc = new Date(reenc.fecha).toLocaleDateString('es-VE', { timeZone: 'America/Caracas', day: '2-digit', month: '2-digit', year: 'numeric' });
+                    } catch (e) { fechaReenc = ''; }
+                    const resumenReenc = reenc.resumen ? ` y hablamos de: ${reenc.resumen}` : '';
+                    const msgReenc = `👋 Hola de nuevo, *${nombreReenc}*. La última vez que conversamos fue el ${fechaReenc}${resumenReenc}. ¿Cómo le fue?`;
+                    await safeSendMessage(from, { text: msgReenc });
+                    try { await guardarMensaje(from, 'model', msgReenc); } catch (e) {}
+                }
+            }
+
+            // --- 1c. INTERÉS MAYORISTA / REGISTRO DE EMPRESA ---
+            if (!isAdmin && detectarInteresMayorista(rawText) && !parecePedidoOperativo(rawText)) {
+                const manejado = await enviarRegistroMayorista(from, pushName, rawText, sesion);
+                if (manejado) return;
+            }
+
             // --- 1d. ENRUTADOR IA: lenguaje natural bajo parámetros ---
             // La IA decide la acción, pero solo puede ejecutar el catálogo
             // comandos.json. Los flujos críticos (pedidos, comprobantes, RIF,
@@ -3102,7 +3411,7 @@ async function startBot() {
                 try {
                     let historial = [];
                     try {
-                        const [h] = await pool.execute("SELECT rol, contenido FROM historial_chat WHERE telefono = ? ORDER BY id DESC LIMIT 4", [from]);
+                        const [h] = await pool.execute(`SELECT rol, contenido FROM historial_chat WHERE telefono = ? ORDER BY id DESC LIMIT ${HIST_MSGS}`, [from]);
                         historial = h.reverse().map(x => ({ rol: x.rol, contenido: x.contenido }));
                         if (historial.length && historial[historial.length - 1].contenido === rawText) historial.pop();
                     } catch (e) {}
@@ -4170,11 +4479,68 @@ const server = http.createServer(async (req, res) => {
             }
             res.end("OK");
         });
+    } else if (routename === '/qr.json') {
+        const connected = isBotReady() || qrCodeData === 'ONLINE ✅';
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({
+            ok: true,
+            status: connected ? 'connected' : (qrCodeData.startsWith('data') ? 'waiting_qr' : 'starting'),
+            qr: qrCodeData.startsWith('data') ? qrCodeData : null,
+            generated_at: qrGeneratedAt,
+            pairing: pairingCodeData
+        }));
+    } else if (routename === '/pair' && req.method === 'POST') {
+        let b = '';
+        req.on('data', c => b += c);
+        req.on('end', async () => {
+            try {
+                const params = new URLSearchParams(b);
+                const phone = (params.get('phone') || '').replace(/\D/g, '');
+                if (phone.length < 10) {
+                    res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+                    return res.end('Número inválido. Use el número del bot con código de país, sin + ni espacios.<br><a href="/">Volver</a>');
+                }
+                if (isBotReady()) {
+                    res.writeHead(302, { Location: '/' });
+                    return res.end();
+                }
+                if (!socketBot) {
+                    startBot();
+                    await sleep(5000);
+                }
+                let code;
+                try {
+                    code = await socketBot.requestPairingCode(phone);
+                } catch (e) {
+                    console.log('[PAIR] Reintentando con socket nuevo:', e.message);
+                    startBot();
+                    await sleep(6000);
+                    if (!socketBot) throw e;
+                    code = await socketBot.requestPairingCode(phone);
+                }
+                pairingCodeData = code;
+                pairingPhone = phone;
+                console.log(`[PAIR] Código generado para ${phone}: ${code}`);
+                res.writeHead(302, { Location: '/' });
+                res.end();
+            } catch (e) {
+                console.log('[PAIR] Error:', e.message);
+                res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end('No se pudo generar el código: ' + e.message + '<br><a href="/">Volver</a>');
+            }
+        });
     } else if (routename === '/reset-sesion') {
         try {
-            if (fs.existsSync('auth_info')) {
-                fs.rmSync('auth_info', { recursive: true, force: true });
+            if (socketBot) {
+                try { socketBot.removeAllListeners(); socketBot.end(undefined); } catch (e) {}
+                socketBot = null;
             }
+            if (fs.existsSync(AUTH_DIR)) {
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            }
+            qrCodeData = "Iniciando...";
+            botStarting = false;
+            programarReinicio(2000);
             res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Sesión borrada</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><meta http-equiv="refresh" content="5;url=/"> </head><body class="bg-light"><div class="container mt-5 text-center"><div class="card shadow p-5 mx-auto" style="max-width:500px;border-radius:15px;"><h3>✅ Sesión borrada</h3><p class="mt-3">La carpeta <strong>auth_info</strong> se eliminó correctamente.</p><p>El bot mostrará un nuevo código QR en <strong>5 segundos</strong>.</p><a href="/" class="btn btn-primary mt-3">Ir al inicio</a></div></div></body></html>`);
         } catch (e) { res.end("Error al borrar sesión: " + e.message); }
     } else if (routename === '/notificador-estado') {
@@ -5060,8 +5426,34 @@ const server = http.createServer(async (req, res) => {
             bot: isBotReady() ? 'online' : 'offline',
             ia: ia.estaHabilitada() ? 'activa' : 'desactivada',
             procesos: procesosEstado,
+            licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-reporte') {
+        try {
+            const pregunta = query.texto || '';
+            const respuesta = await reportesIA.preguntar(pregunta);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ pregunta, respuesta }, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-catalogo') {
+        try {
+            const texto = query.texto || '';
+            const [vehiculo, pieza, oem, compat] = await Promise.all([
+                catalogoTecnico.extraerVehiculo(texto),
+                catalogoTecnico.extraerPieza(texto),
+                catalogoTecnico.buscarPorOEM(texto),
+                catalogoTecnico.buscarCompatibles(texto)
+            ]);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ texto, vehiculo, pieza, oem, compat }, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }));
+        }
     } else if (routename === '/test-intent') {
         try {
             const texto = query.texto || '';
@@ -5468,7 +5860,7 @@ document.getElementById('sql').addEventListener('keydown',e=>{if(e.ctrlKey&&e.ke
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-<meta http-equiv="refresh" content="15">
+<meta http-equiv="refresh" content="${qrCodeData.startsWith('data') ? 60 : 30}">
 <title>ONE4CARS Admin</title>
 <style>
 body{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;font-family:'Segoe UI',system-ui,sans-serif}
@@ -5512,9 +5904,18 @@ ${qrCodeData.startsWith('data') ? `
 <div class="col-12 col-sm-6 col-md-4">
 <div class="card-dash p-4 text-center">
 <h6 class="text-white-50 mb-3"><i class="bi bi-qr-code me-2"></i>Escanee el QR</h6>
-<div class="qr-container">${qrCodeData.startsWith('data') ? `<img src="${qrCodeData}" class="img-fluid" style="max-width:220px">` : ''}</div>
-<p class="text-white-50 small mt-2">Conecte su WhatsApp para usar el bot</p>
+<div class="qr-container">${qrCodeData.startsWith('data') ? `<img id="qrImg" src="${qrCodeData}" class="img-fluid" style="max-width:220px">` : ''}</div>
+<p class="text-white-50 small mt-2 mb-1">Conecte su WhatsApp para usar el bot</p>
+<p id="qrTime" class="text-white-50 small mb-0">QR generado: ${qrGeneratedAt ? qrGeneratedAt.toLocaleTimeString('es-VE', { timeZone: 'America/Caracas' }) : '—'} · válido ~60 s</p>
 <a href="/reset-sesion" class="btn btn-outline-light btn-sm mt-2" onclick="return confirm('¿Borrar sesión y generar nuevo QR?')"><i class="bi bi-arrow-repeat me-1"></i>Nuevo QR</a>
+<div class="mt-3 pt-3" style="border-top:1px solid rgba(255,255,255,.12)">
+<p class="text-white-50 small mb-2">¿No funciona el QR? Genere un código de vinculación:</p>
+<form method="POST" action="/pair" class="d-flex gap-2">
+<input name="phone" class="form-control form-control-sm" placeholder="Número del bot: 58414..." required style="background:rgba(0,0,0,.3);color:#fff;border-color:rgba(255,255,255,.2)">
+<button class="btn btn-outline-light btn-sm" type="submit">Generar</button>
+</form>
+${pairingCodeData ? `<div class="alert alert-info mt-2 mb-0 py-2" style="border-radius:10px">Código: <b style="font-size:1.25rem;letter-spacing:2px">${pairingCodeData}</b><br><small>WhatsApp → Dispositivos vinculados → Vincular con número de teléfono.</small></div>` : ''}
+</div>
 </div>
 </div>
 </div>
@@ -5759,6 +6160,28 @@ document.querySelectorAll('#frecSel, #zonaSel, #fechaSel').forEach(el => {
     el.addEventListener('keydown', e => { if(e.key==='Enter') agendarZona(); });
 });
 </script>
+<script>
+(function(){
+    var img = document.getElementById('qrImg');
+    var last = img ? img.src : '';
+    var timeEl = document.getElementById('qrTime');
+    if (!img) return;
+    setInterval(function(){
+        fetch('/qr.json', { cache: 'no-store' })
+            .then(function(r){ return r.json(); })
+            .then(function(j){
+                if (j.status === 'connected') { location.reload(); return; }
+                if (j.qr && j.qr !== last) {
+                    last = j.qr;
+                    img.src = j.qr;
+                }
+                if (timeEl && j.generated_at) {
+                    timeEl.textContent = 'QR generado: ' + new Date(j.generated_at).toLocaleTimeString('es-VE', { timeZone: 'America/Caracas' }) + ' · válido ~60 s';
+                }
+            }).catch(function(){});
+    }, 4000);
+})();
+</script>
 </body>
 </html>`);
     }
@@ -5767,6 +6190,8 @@ document.querySelectorAll('#frecSel, #zonaSel, #fechaSel').forEach(el => {
 server.listen(PORT, process.env.BIND_HOST || '0.0.0.0', async () => {
     await initDB();
     await cargarConfigBD();
+    await licencia.verificar(true);
+    setInterval(() => licencia.verificar(true).catch(e => console.log('[LICENCIA] Error:', e.message)), 5 * 60 * 1000);
     await restaurarSesiones();
     startBot();
     actualizarDolar();

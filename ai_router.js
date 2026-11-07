@@ -145,7 +145,7 @@ CONTEXTO DE ESTA CONVERSACIÓN
 - Teléfono: ${contexto.telefono || 'No disponible'}
 - Rol: ${contexto.esAdmin ? 'administrador' : (contexto.vendedor ? 'vendedor' : 'cliente')}
 - Sesión validada: ${contexto.sesionValidada ? 'sí' : 'no'}
-- Últimos mensajes: ${JSON.stringify(contexto.historial || []).slice(0, 1200)}
+- Últimos mensajes: ${JSON.stringify(contexto.historial || []).slice(-3000)}
 
 FORMATO DE SALIDA
 Responde SOLO un objeto JSON válido, sin markdown ni texto adicional:
@@ -283,7 +283,7 @@ async function decidir(mensaje, contexto = {}) {
         return local;
     }
     const system = construirPrompt(contexto);
-    const historial = Array.isArray(contexto.historial) ? contexto.historial.slice(-4) : [];
+    const historial = Array.isArray(contexto.historial) ? contexto.historial.slice(-40) : [];
     const messages = [{ role: 'system', content: system }];
     for (const h of historial) {
         if (!h || !h.rol || !h.contenido) continue;
