@@ -1218,30 +1218,47 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
     }
 
-    // 3) Conversión de montos a BCV
-    const mencionaBcv = /(bcv|bol[ií]vares|bs\.?|tasa)/i.test(tl);
-    if (mencionaBcv) {
-        const numMatch = t.match(/([0-9][0-9.,]*)/);
+    // 3) Cotizaciones y conversiones (BCV / Binance P2P / paralelo)
+    const mencionaBinance = /binance|p2p/i.test(tl);
+    const mencionaParalelo = /paralelo|monitor/i.test(tl);
+    const mencionaBcv = /bcv/i.test(tl);
+    const mencionaBolivares = /bol[ií]vares|bs\.?/i.test(tl);
+    const pideCotizacion = /(cotizaci[oó]n|cotizacion|tasa|cambio)/i.test(tl);
+    const hablaDeDolar = /(d[oó]lar|usd|\$)/i.test(tl);
+    if (mencionaBinance || mencionaParalelo || mencionaBcv || mencionaBolivares || (pideCotizacion && hablaDeDolar)) {
         try {
-            if (!numMatch || !numMatch[1]) {
-                await safeSendMessage(from, { text: '💵 Indíqueme el monto. Ejemplo: *cuánto es 102.30$ a BCV*' });
-                return true;
-            }
-            if ((!dolarInfo.bcv || parseFloat(dolarInfo.bcv) <= 1) && typeof actualizarDolar === 'function') {
+            // Refrescar tasas si están vacías o viejas
+            if ((!dolarInfo.bcv || parseFloat(dolarInfo.bcv) <= 1 ||
+                 !dolarInfo.binance || parseFloat(dolarInfo.binance) <= 1) && typeof actualizarDolar === 'function') {
                 try { await actualizarDolar(); } catch (e) {}
             }
-            const tasa = parseFloat(dolarInfo.bcv) || 0;
+            const nombreTasa = mencionaBinance ? 'BINANCE P2P' : (mencionaParalelo ? 'PARALELO' : 'BCV');
+            const tasa = mencionaBinance
+                ? (parseFloat(dolarInfo.binance) || 0)
+                : (mencionaParalelo ? (parseFloat(dolarInfo.paralelo) || 0) : (parseFloat(dolarInfo.bcv) || 0));
+            const numMatch = t.match(/([0-9][0-9.,]*)/);
+
+            // Sin monto: mostrar cotización
+            if (!numMatch || !numMatch[1]) {
+                const bcvTxt = formatoBs(parseFloat(dolarInfo.bcv) || 0);
+                const binTxt = formatoBs(parseFloat(dolarInfo.binance) || 0);
+                const parTxt = formatoBs(parseFloat(dolarInfo.paralelo) || 0);
+                await safeSendMessage(from, { text: `💱 *COTIZACIONES DEL DÍA*\n\n• BCV: *${bcvTxt} Bs./USD*\n• Binance P2P: *${binTxt} Bs./USD*\n• Paralelo: *${parTxt} Bs./USD*\n\nEjemplo: *cuánto es 137$ a binance*` });
+                return true;
+            }
+
             if (tasa <= 1) {
-                await safeSendMessage(from, { text: '⚠️ No pude obtener la tasa BCV en este momento. Intente de nuevo en unos minutos.' });
+                await safeSendMessage(from, { text: `⚠️ No pude obtener la tasa ${nombreTasa} en este momento. Intente de nuevo en unos minutos.` });
                 return true;
             }
             const monto = parseMonto(numMatch[1]);
             if (isNaN(monto)) { await safeSendMessage(from, { text: '❌ No entendí el monto.' }); return true; }
-            const esBolivares = /(bs\.?|bol[ií]vares)/i.test(tl) && !/(\$|usd|d[oó]lares?)/i.test(tl);
+            const esBolivares = mencionaBolivares && !hablaDeDolar;
+            const destinoTxt = mencionaBinance ? 'BOLÍVARES (BINANCE P2P)' : (mencionaParalelo ? 'BOLÍVARES (PARALELO)' : 'BCV');
             if (esBolivares) {
-                await safeSendMessage(from, { text: `💵 *CONVERSIÓN A USD*\n\n*Bs. ${formatoBs(monto)}* ÷ *${formatoBs(tasa)} Bs./USD* = *$${formatoBs(monto / tasa)}*\n\n_Tasa BCV del día._` });
+                await safeSendMessage(from, { text: `💵 *CONVERSIÓN A USD (${nombreTasa})*\n\n*Bs. ${formatoBs(monto)}* ÷ *${formatoBs(tasa)} Bs./USD* = *$${formatoBs(monto / tasa)}*\n\n_Tasa ${nombreTasa} del día._` });
             } else {
-                await safeSendMessage(from, { text: `💵 *CONVERSIÓN A BCV*\n\n*$${formatoBs(monto)}* × *${formatoBs(tasa)} Bs./USD* = *Bs. ${formatoBs(monto * tasa)}*\n\n_Tasa BCV del día._` });
+                await safeSendMessage(from, { text: `💵 *CONVERSIÓN A ${destinoTxt}*\n\n*$${formatoBs(monto)}* × *${formatoBs(tasa)} Bs./USD* = *Bs. ${formatoBs(monto * tasa)}*\n\n_Tasa ${nombreTasa} del día._` });
             }
             return true;
         } catch (e) {
