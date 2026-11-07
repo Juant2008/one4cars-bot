@@ -1134,6 +1134,65 @@ async function buscarClientesPorNombre(term) {
     } catch (e) { return []; }
 }
 
+async function buscarVendedorPorNombre(term) {
+    try {
+        const t = String(term || '').trim();
+        const [r] = await pool.execute(
+            `SELECT id_vendedor, nombre, celular_vendedor, telefono_vendedor, zona, activo
+             FROM tab_vendedores
+             WHERE nombre LIKE ? ORDER BY nombre LIMIT 1`,
+            [`%${t}%`]
+        );
+        return r[0] || null;
+    } catch (e) { return null; }
+}
+
+async function facturasPendientesCliente(idCliente) {
+    try {
+        const [r] = await pool.execute(
+            `SELECT id_factura, nro_factura, fecha_reg, total, abono_factura, porcentaje,
+                    DATEDIFF(CURDATE(), fecha_reg) AS dias
+             FROM tab_facturas
+             WHERE id_cliente = ? AND anulado = 'no' AND pagada = 'NO'
+             ORDER BY fecha_reg ASC`,
+            [idCliente]
+        );
+        return r || [];
+    } catch (e) { return []; }
+}
+
+async function resumenCarteraVendedor(idVendedor) {
+    try {
+        const [porCliente] = await pool.execute(
+            `SELECT c.id_cliente, c.nombres,
+                    COUNT(f.id_factura) facturas,
+                    ROUND(SUM((f.total - f.abono_factura) / (f.porcentaje || 1)), 2) saldo,
+                    MAX(DATEDIFF(CURDATE(), f.fecha_reg)) dias
+             FROM tab_facturas f
+             JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+             WHERE f.id_vendedor = ? AND f.pagada = 'NO' AND f.anulado = 'no'
+             GROUP BY c.id_cliente
+             ORDER BY saldo DESC`,
+            [idVendedor]
+        );
+        const [tot] = await pool.execute(
+            `SELECT COUNT(*) facturas, ROUND(SUM((total - abono_factura) / (porcentaje || 1)), 2) saldo
+             FROM tab_facturas WHERE id_vendedor = ? AND pagada = 'NO' AND anulado = 'no'`,
+            [idVendedor]
+        );
+        const filas = porCliente || [];
+        return {
+            clientes: filas.length,
+            facturas: Number(tot && tot[0] ? tot[0].facturas : 0) || 0,
+            saldo: Number(tot && tot[0] ? tot[0].saldo : 0) || 0,
+            detalle: filas.map(f => ({ nombres: f.nombres, saldo: Number(f.saldo) || 0, dias: Number(f.dias) || 0 }))
+        };
+    } catch (e) {
+        console.log('[CONSULTA] Error cartera vendedor:', e.message);
+        return { clientes: 0, facturas: 0, saldo: 0, detalle: [] };
+    }
+}
+
 function parseMonto(txt) {
     let s = String(txt || '').replace(/[^\d.,]/g, '');
     if (!s) return NaN;
@@ -1191,6 +1250,106 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
+        // 2a) Estado de cuenta de un vendedor
+        const mVendEc = t.match(/estado de cuenta\s+(?:del?\s+)?vendedor\s+(.+)/i)
+            || t.match(/(?:cartera|cuentas? por cobrar)\s+(?:del?\s+)?(?:vendedor\s+)?(.+)/i);
+        if (mVendEc) {
+            const term = mVendEc[1].replace(/[?.!]+$/g, '').trim();
+            const vend = await buscarVendedorPorNombre(term);
+            if (!vend) {
+                await safeSendMessage(from, { text: `❌ No encontré un vendedor que coincida con "*${term}*".` });
+                return true;
+            }
+            const resumen = await resumenCarteraVendedor(vend.id_vendedor);
+            let msg = `📊 *CARTERA DEL VENDEDOR*\n\n🧑‍💼 *${vend.nombre}*\n`;
+            if (vend.celular_vendedor) msg += `📞 ${vend.celular_vendedor}\n`;
+            msg += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
+            if (resumen.detalle.length) {
+                msg += `\n*Clientes con mayor saldo:*\n`;
+                resumen.detalle.slice(0, 12).forEach((c, i) => {
+                    msg += `${i + 1}. ${c.nombres} — *$${formatoBs(c.saldo)}* (${c.dias}d)\n`;
+                });
+                if (resumen.detalle.length > 12) msg += `… y ${resumen.detalle.length - 12} más.\n`;
+            }
+            await safeSendMessage(from, { text: msg.trim() });
+            return true;
+        }
+
+        // 2b) Estado de cuenta de un cliente (con facturas firmadas)
+        const mEc = t.match(/estado de cuenta\s+(?:de|del|para)\s+(.+)/i);
+        if (mEc) {
+            const term = mEc[1].replace(/[?.!]+$/g, '').trim();
+            const clientes = await buscarClientesPorNombre(term);
+            if (!clientes.length) {
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                return true;
+            }
+            const c = clientes[0];
+            const facturas = await facturasPendientesCliente(c.id_cliente);
+            let msg = `📊 *ESTADO DE CUENTA*\n\n👤 *${c.nombres}*\n🆔 RIF: ${c.clave || '—'}\n🧑‍💼 Vendedor: ${c.vendedor || '—'}\n🏷️ Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
+            if (!facturas.length) {
+                msg += `\n✅ Sin facturas pendientes. Cuenta al día.`;
+            } else {
+                let total = 0;
+                msg += `\n*Facturas pendientes (${facturas.length}):*\n`;
+                facturas.slice(0, 10).forEach((f, i) => {
+                    const saldo = (parseFloat(f.total) - parseFloat(f.abono_factura || 0)) / (parseFloat(f.porcentaje) || 1);
+                    total += saldo;
+                    msg += `\n*${i + 1}. #${f.nro_factura}* · ${new Date(f.fecha_reg).toISOString().split('T')[0]} · ${f.dias}d · *$${formatoBs(saldo)}*\n✍️ https://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg\n`;
+                });
+                if (facturas.length > 10) msg += `\n… y ${facturas.length - 10} factura(s) más.\n`;
+                msg += `\n💰 *Total pendiente: $${formatoBs(total)}*`;
+            }
+            await safeSendMessage(from, { text: msg.trim() });
+            return true;
+        }
+
+        // 2c) ¿Qué tipo de cliente es X?
+        const mTipo = t.match(/(?:qu[eé]\s+tipo\s+(?:de cliente\s+)?(?:es|tiene)|tipo de cliente\s+(?:de|del))\s+(.+)/i);
+        if (mTipo) {
+            const term = mTipo[1].replace(/[?.!]+$/g, '').trim();
+            const clientes = await buscarClientesPorNombre(term);
+            if (!clientes.length) {
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                return true;
+            }
+            let msg = `🏷️ *TIPO DE CLIENTE*\n\n`;
+            clientes.slice(0, 3).forEach((c, i) => {
+                msg += `${clientes.length > 1 ? i + 1 + '. ' : ''}👤 *${c.nombres}*\n`;
+                msg += `• Tipo: *${c.tipo || '—'}*\n`;
+                msg += `• Oficina: ${c.cliente_oficina === 'SI' ? 'SÍ' : 'NO'}\n`;
+                msg += `• Vendedor: ${c.vendedor || '—'}\n`;
+                msg += `• Activo: ${String(c.activo || '').toUpperCase() === 'SI' ? 'SÍ' : 'NO'}\n\n`;
+            });
+            await safeSendMessage(from, { text: msg.trim() });
+            return true;
+        }
+
+        // 2d) ¿Qué vendedor atiende al cliente X?
+        const mVend = t.match(/(?:qu[eé]|cu[aá]l)\s+vendedor\s+(?:atiende|tiene|le toca|visita|es)\s+(?:a\s+|al cliente\s+)?(.+)/i);
+        if (mVend) {
+            const term = mVend[1].replace(/[?.!]+$/g, '').trim();
+            const clientes = await buscarClientesPorNombre(term);
+            if (!clientes.length) {
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                return true;
+            }
+            let msg = '';
+            clientes.slice(0, 3).forEach((c, i) => {
+                msg += `${clientes.length > 1 ? i + 1 + '. ' : ''}👤 *${c.nombres}* → 🧑‍💼 *${c.vendedor || 'sin vendedor'}*`;
+                if (c.zona) msg += `\n   Zona: ${c.zona}`;
+                msg += `\n\n`;
+            });
+            const prim = clientes[0];
+            if (prim.vendedor) {
+                const v = await buscarVendedorPorNombre(prim.vendedor);
+                if (v && v.celular_vendedor) msg += `📞 Teléfono del vendedor: ${v.celular_vendedor}`;
+            }
+            await safeSendMessage(from, { text: msg.trim() });
+            return true;
+        }
+
+        // 2e) Datos generales de un cliente
         const mDato = t.match(/(tel[eé]fono|celular|rif|c[eé]dula|cedula|direcci[oó]n|vendedor|zona|datos|todo)\s*(?:de|del|para)\s+(.+)/i);
         if (mDato) {
             const term = mDato[2].replace(/[?.!]+$/g, '').trim();
