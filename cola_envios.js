@@ -33,8 +33,8 @@ function init(pool, { enviar, format }) {
     formatRef = format;
 }
 
-function crearTablas() {
-    return poolRef.query(`CREATE TABLE IF NOT EXISTS bot_cola_envios (
+async function crearTablas() {
+    await poolRef.query(`CREATE TABLE IF NOT EXISTS bot_cola_envios (
         id INT AUTO_INCREMENT PRIMARY KEY,
         tipo VARCHAR(40) NOT NULL,
         telefono VARCHAR(100) NOT NULL,
@@ -45,12 +45,14 @@ function crearTablas() {
         fecha_creada TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         fecha_envio DATETIME NULL,
         destino_real VARCHAR(100) NULL,
+        forzar_real TINYINT NOT NULL DEFAULT 0,
         intentos INT NOT NULL DEFAULT 0,
         error VARCHAR(300) NULL,
         INDEX idx_estado (estado, prioridad, fecha_creada),
         INDEX idx_tipo (tipo),
         INDEX idx_tel (telefono)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
+    try { await poolRef.query("ALTER TABLE bot_cola_envios ADD COLUMN forzar_real TINYINT NOT NULL DEFAULT 0"); } catch (e) {}
 }
 
 async function cargar() {
@@ -120,7 +122,7 @@ async function enviadosHoy() {
     }
 }
 
-async function encolar({ tipo, telefono, nombre = null, texto, prioridad = 5 }) {
+async function encolar({ tipo, telefono, nombre = null, texto, prioridad = 5, real = false }) {
     if (!telefono || !texto) return false;
     const tel = String(telefono).replace(/\s+/g, '').trim();
     if (!tel) return false;
@@ -131,9 +133,9 @@ async function encolar({ tipo, telefono, nombre = null, texto, prioridad = 5 }) 
         );
         if (dup && dup.length) return false;
         await poolRef.query(
-            `INSERT INTO bot_cola_envios (tipo, telefono, nombre, texto, prioridad)
-             VALUES (?, ?, ?, ?, ?)`,
-            [tipo, tel, nombre, texto, prioridad]
+            `INSERT INTO bot_cola_envios (tipo, telefono, nombre, texto, prioridad, forzar_real)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [tipo, tel, nombre, texto, prioridad, real ? 1 : 0]
         );
         return true;
     } catch (e) {
@@ -194,7 +196,7 @@ async function tick(opciones = {}) {
 
         const item = await siguiente();
         if (!item) return;
-        const destino = config.modo_prueba
+        const destino = (config.modo_prueba && !Number(item.forzar_real))
             ? formatRef(config.telefono_prueba)
             : formatRef(item.telefono);
         if (!destino) return;

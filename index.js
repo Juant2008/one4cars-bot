@@ -243,6 +243,7 @@ const colaEnvios = require('./cola_envios');
 const automatizaciones = require('./automatizaciones');
 const aprendizaje = require('./aprendizaje');
 const rutas = require('./rutas');
+const acciones = require('./acciones');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
@@ -269,6 +270,13 @@ reportesIA.init(pool);
 licencia.init(pool);
 aprendizaje.init(pool);
 rutas.init(pool);
+acciones.init(pool, {
+    encolar: (opts) => colaEnvios.encolar(opts),
+    enviar: async (jid, texto) => { await enviarTexto(jid, texto); },
+    fmt: formatWhatsApp,
+    excluidos: () => automatizaciones.clientesExcluidosCobranza(),
+    cola: colaEnvios
+});
 automatizaciones.init(pool, {
     enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
     format: formatWhatsApp,
@@ -674,6 +682,28 @@ async function safeSendMessage(jid, content) {
     } catch (e) {
         console.log(`[MSG] ❌ Error enviando mensaje:`, e.message);
     }
+}
+
+/** Envía un texto largo dividiéndolo en varios mensajes sin cortar palabras. */
+async function enviarTexto(jid, texto, maxLen = 3500) {
+    const t = String(texto || '');
+    if (!t) return;
+    if (t.length <= maxLen) {
+        await safeSendMessage(jid, { text: t });
+        return;
+    }
+    const lineas = t.split('\n');
+    let bloque = '';
+    for (const linea of lineas) {
+        if ((bloque + '\n' + linea).length > maxLen && bloque) {
+            await safeSendMessage(jid, { text: bloque });
+            bloque = linea;
+            await new Promise(r => setTimeout(r, 1200));
+        } else {
+            bloque = bloque ? bloque + '\n' + linea : linea;
+        }
+    }
+    if (bloque) await safeSendMessage(jid, { text: bloque });
 }
 
 function isBotReady() {
@@ -1274,6 +1304,17 @@ function menuGerente() {
 • otra opción
 • ruta LOS TEQUES
 
+🚀 *Acciones (el bot las ejecuta, no solo informa)*
+• recuérdale la deuda a los clientes con más de 50 días
+• recuérdale la deuda de la zona LOS TEQUES a 10 clientes
+• recuérdale la deuda al cliente DAVERFREN
+• recuérdale la visita a los clientes sin comprar hace 90 días
+• envía el estado de cuenta a los clientes con más de 30 días
+• envía la lista de precios a los clientes de la zona CATIA
+• lanza campaña fría de la zona BARUTA con más de 90 días
+• avisa a los vendedores su cartera
+• no cobrar a los clientes de la zona CATIA
+
 📮 *Envíos anti-baneo*
 • cola
 • cola pausa / cola reanudar
@@ -1350,22 +1391,100 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
+        // 1x) Acciones naturales (envíos y ajustes, no consultas)
+        if (await acciones.manejar(from, t)) return true;
+
+        // 1y) Acción natural: recordar/cobrar deudas con filtros
+        if (/(?:recu[eé]rdale|recu[eé]rdales|recordar|recordatorio|c[oó]brale|c[oó]brales|cobrar|env[ií]a(?:le|les)?|manda(?:le|les)?)/i.test(t) &&
+            /(deuda|factura|saldo|pago|cobro|cobranza)/i.test(t)) {
+            try {
+                const mDias = t.match(/(?:m[aá]s de|mayor(?:es)? a|desde|superior a)\s+(\d{1,3})\s*d[ií]as/i)
+                    || t.match(/(\d{1,3})\s*d[ií]as/i);
+                const dias = mDias ? parseInt(mDias[1], 10) : 30;
+                const mLim = t.match(/(?:a|para)\s+(\d{1,3})\s+clientes/i) || t.match(/l[ií]mite\s+(\d{1,3})/i);
+                const limite = Math.min(mLim ? parseInt(mLim[1], 10) : 20, 50);
+                const mZona = t.match(/zona\s+(.+?)(?:\s+(?:con|que|y)\s+|$)/i);
+                const mVend = t.match(/vendedor\s+(.+?)(?:\s+(?:con|que|y)\s+|$)/i);
+                const mCli = t.match(/\bal\s+cliente\s+(.+?)(?:\s+(?:con|que|y)\s+|$)/i);
+                const limpiarFiltro = (s) => String(s || '')
+                    .replace(/\s+(?:a|para)\s+\d{1,3}\s+clientes?.*$/i, '')
+                    .replace(/\s+(?:con|que|y)\s+.*$/i, '')
+                    .replace(/[?.!]+$/g, '')
+                    .trim();
+
+                let sql = `SELECT c.id_cliente, c.nombres, c.celular,
+                                  COUNT(*) AS facturas,
+                                  ROUND(SUM(f.total - f.abono_factura), 2) AS saldo,
+                                  MAX(DATEDIFF(CURDATE(), f.fecha_reg)) AS dias_max,
+                                  SUBSTRING_INDEX(GROUP_CONCAT(f.nro_factura ORDER BY f.fecha_reg ASC), ',', 1) AS nro_antigua
+                           FROM tab_facturas f
+                           JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                           WHERE f.pagada = 'NO' AND f.anulado = 'no'
+                             AND DATEDIFF(CURDATE(), f.fecha_reg) >= ?
+                             AND c.celular <> ''`;
+                const params = [dias];
+                if (mZona) { sql += " AND c.zona LIKE ?"; params.push(`%${mZona[1].trim()}%`); }
+                if (mVend) { sql += " AND c.vendedor LIKE ?"; params.push(`%${mVend[1].trim()}%`); }
+                if (mCli) { sql += " AND c.nombres LIKE ?"; params.push(`%${mCli[1].trim()}%`); }
+                sql += " GROUP BY c.id_cliente ORDER BY saldo DESC LIMIT ?";
+                params.push(limite);
+
+                const [rows] = await pool.execute(sql, params);
+                const excluidos = await automatizaciones.clientesExcluidosCobranza();
+                let encolados = 0, omitidos = 0;
+                let saldoTotal = 0;
+                const nombresEncolados = [];
+                for (const r of (rows || [])) {
+                    if (excluidos.has(Number(r.id_cliente))) { omitidos++; continue; }
+                    const tel = String(r.celular || '').trim();
+                    const [prev] = await pool.execute(
+                        "SELECT 1 FROM bot_campania_log WHERE campania='cobranza_nl' AND telefono=? AND fecha > DATE_SUB(NOW(), INTERVAL 7 DAY) LIMIT 1",
+                        [tel]
+                    ).catch(() => [[]]);
+                    if (prev && prev.length) { omitidos++; continue; }
+                    const monto = Number(r.saldo) || 0;
+                    saldoTotal += monto;
+                    const texto = `🧾 *FACTURA PENDIENTE — ONE4CARS*\n\nHola *${r.nombres}*, le informamos que mantiene una factura pendiente que debe pagar a la brevedad posible:\n\n• Factura N°: *${r.nro_antigua}*\n• Monto adeudado: *$${formatoBs(monto)}*\n• Días de vencida: *${r.dias_max}*\n\n✍️ Factura firmada:\nhttps://www.one4cars.com/uploads/notas/${r.nro_antigua}.jpg\n\nSi ya realizó el pago, por favor comparta el comprobante por este chat. Gracias. 🚗`;
+                    const ok = await colaEnvios.encolar({ tipo: 'cobranza', telefono: tel, nombre: r.nombres, texto, prioridad: 2, real: true });
+                    if (ok) {
+                        encolados++;
+                        nombresEncolados.push(`${r.nombres} ($${formatoBs(monto)})`);
+                        try { await pool.execute("INSERT INTO bot_campania_log (campania, telefono) VALUES ('cobranza_nl', ?)", [tel]); } catch (e) {}
+                    } else {
+                        omitidos++;
+                    }
+                }
+                let msgAcc = `📨 *RECORDATORIOS PROCESADOS*\n\n• Clientes con deuda +${dias} días: *${(rows || []).length}*\n• Mensajes en cola: *${encolados}*\n• Omitidos (no cobrar o ya avisados esta semana): *${omitidos}*\n• Saldo total: *$${formatoBs(saldoTotal)}*\n`;
+                if (nombresEncolados.length) {
+                    msgAcc += `\n*Encolados (${nombresEncolados.length}):*\n`;
+                    nombresEncolados.forEach((n, i) => { msgAcc += `${i + 1}. ${n}\n`; });
+                }
+                msgAcc += `\n✅ Estos recordatorios saldrán a los *clientes reales*, según la cola anti-baneo (lunes a viernes).`;
+                await enviarTexto(from, msgAcc);
+                return true;
+            } catch (e) {
+                console.log('[ACCION] Error recordatorio:', e.message);
+                await safeSendMessage(from, { text: `❌ No pude procesar el recordatorio: ${e.message}` });
+                return true;
+            }
+        }
+
         // 1z) Ruta de venta del día
         if (/(?:a\s+d[oó]nde\s+(?:deber[ií]a\s+|debo\s+|me\s+conviene\s+)?(?:vender|ir|visitar)|qu[eé]\s+zona[s]?\s+(?:deber[ií]a\s+|debo\s+)?(?:vender|visitar|atender)|ruta\s+(?:de\s+)?(?:hoy|del\s+d[ií]a|de\s+ventas|de\s+visitas)|plan\s+de\s+(?:ventas|visitas)|d[oó]nde\s+vendo\s+hoy|d[oó]nde\s+vender\s+hoy)/i.test(t)) {
-            await safeSendMessage(from, { text: await rutas.textoRuta(from) });
+            await enviarTexto(from, await rutas.textoRuta(from));
             return true;
         }
         // Otra opción de ruta (si la anterior no sirve por tráfico, etc.)
         if (rutas.tieneSesion(from) && (/^(?:dame\s+)?(?:otra|siguiente)\b/i.test(t) ||
             /^(?:otra|siguiente)\s+(?:opci[oó]n|zona|ruta)\b/i.test(t) ||
             /^(?:no\s+me\s+(?:gusta|sirve)|esa\s+no|otra\s+por\s+favor|hay\s+mucho\s+tr[aá]fico)/i.test(t))) {
-            await safeSendMessage(from, { text: await rutas.otraRuta(from) });
+            await enviarTexto(from, await rutas.otraRuta(from));
             return true;
         }
         const mZona = t.match(/^ruta\s+(?!de\s+hoy\b|del\s+d[ií]a\b|hoy\b|de\s+ventas\b|de\s+visitas\b)(.+)$/i);
         if (mZona) {
             const zonaTerm = mZona[1].replace(/[?.!]+$/g, '').trim();
-            await safeSendMessage(from, { text: await rutas.textoZona(zonaTerm) });
+            await enviarTexto(from, await rutas.textoZona(zonaTerm));
             return true;
         }
 
@@ -1384,13 +1503,12 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             if (vend.celular_vendedor) msg += `📞 ${vend.celular_vendedor}\n`;
             msg += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
             if (resumen.detalle.length) {
-                msg += `\n*Clientes con mayor saldo:*\n`;
-                resumen.detalle.slice(0, 12).forEach((c, i) => {
+                msg += `\n*Clientes con saldo (${resumen.detalle.length}):*\n`;
+                resumen.detalle.forEach((c, i) => {
                     msg += `${i + 1}. ${c.nombres} — *$${formatoBs(c.saldo)}* (${c.dias}d)\n`;
                 });
-                if (resumen.detalle.length > 12) msg += `… y ${resumen.detalle.length - 12} más.\n`;
             }
-            await safeSendMessage(from, { text: msg.trim() });
+            await enviarTexto(from, msg.trim());
             return true;
         }
 
@@ -1408,12 +1526,12 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
                     mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
                     if (resumen.detalle.length) {
-                        mv += `\n*Clientes con mayor saldo:*\n`;
-                        resumen.detalle.slice(0, 12).forEach((c, i) => {
+                        mv += `\n*Clientes con saldo (${resumen.detalle.length}):*\n`;
+                        resumen.detalle.forEach((c, i) => {
                             mv += `${i + 1}. ${c.nombres} — *$${formatoBs(c.saldo)}* (${c.dias}d)\n`;
                         });
                     }
-                    await safeSendMessage(from, { text: mv.trim() });
+                    await enviarTexto(from, mv.trim());
                     return true;
                 }
                 await safeSendMessage(from, { text: `❌ No encontré un cliente ni un vendedor que coincida con "*${term}*".` });
@@ -1428,13 +1546,12 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
                     mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
                     if (resumen.detalle.length) {
-                        mv += `\n*Clientes con mayor saldo:*\n`;
-                        resumen.detalle.slice(0, 12).forEach((d, i) => {
+                        mv += `\n*Clientes con saldo (${resumen.detalle.length}):*\n`;
+                        resumen.detalle.forEach((d, i) => {
                             mv += `${i + 1}. ${d.nombres} — *$${formatoBs(d.saldo)}* (${d.dias}d)\n`;
                         });
-                        if (resumen.detalle.length > 12) mv += `… y ${resumen.detalle.length - 12} más.\n`;
                     }
-                    await safeSendMessage(from, { text: mv.trim() });
+                    await enviarTexto(from, mv.trim());
                     return true;
                 }
             }
@@ -1445,15 +1562,14 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             } else {
                 let total = 0;
                 msg += `\n*Facturas pendientes (${facturas.length}):*\n`;
-                facturas.slice(0, 10).forEach((f, i) => {
+                facturas.forEach((f, i) => {
                     const saldo = Math.max(0, parseFloat(f.total) - parseFloat(f.abono_factura || 0));
                     total += saldo;
                     msg += `\n*${i + 1}. #${f.nro_factura}* · ${new Date(f.fecha_reg).toISOString().split('T')[0]} · ${f.dias}d · *$${formatoBs(saldo)}*\n✍️ https://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg\n`;
                 });
-                if (facturas.length > 10) msg += `\n… y ${facturas.length - 10} factura(s) más.\n`;
                 msg += `\n💰 *Total pendiente: $${formatoBs(total)}*`;
             }
-            await safeSendMessage(from, { text: msg.trim() });
+            await enviarTexto(from, msg.trim());
             return true;
         }
 
@@ -3822,10 +3938,9 @@ async function startBot() {
                             manuales.forEach(c => { msg += `• ${c.nombres || 'ID ' + c.id_cliente} (id ${c.id_cliente})\n`; });
                         }
                         msg += `\n*Sí recibirían cobranza (${cand.length}):*\n`;
-                        cand.slice(0, 25).forEach(c => { msg += `• ${c.id_cliente} · ${c.nombres} · $${c.saldo} · ${c.dias}d\n`; });
-                        if (cand.length > 25) msg += `… y ${cand.length - 25} más.\n`;
+                        cand.forEach(c => { msg += `• ${c.id_cliente} · ${c.nombres} · $${c.saldo} · ${c.dias}d\n`; });
                         msg += `\nPara excluir: *no cobrar 1234* o *no cobrar NOMBRE*\nPara quitar: *no cobrar quitar 1234*`;
-                        return await safeSendMessage(from, { text: msg });
+                        return await enviarTexto(from, msg);
                     }
                     if (/^quitar\s+/i.test(resto)) {
                         const quien = resto.replace(/^quitar\s+/i, '').trim();
