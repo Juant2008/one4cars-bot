@@ -143,23 +143,29 @@ async function encolar({ tipo, telefono, nombre = null, texto, prioridad = 5 }) 
 }
 
 async function siguiente() {
-    // Variedad: evitar repetir el mismo tipo que se envió de último.
+    // Rotación justa por tipo: se elige el tipo que hace más tiempo no se envía,
+    // para que la cola no se sature de un solo tipo (ej. cobranza).
     try {
-        if (ultimoTipo) {
-            const [r] = await poolRef.query(
-                `SELECT * FROM bot_cola_envios
-                 WHERE estado = 'pendiente' AND tipo <> ?
-                 ORDER BY prioridad ASC, fecha_creada ASC LIMIT 1`,
-                [ultimoTipo]
-            );
-            if (r && r.length) return r[0];
-        }
-        const [r2] = await poolRef.query(
-            `SELECT * FROM bot_cola_envios
-             WHERE estado = 'pendiente'
-             ORDER BY prioridad ASC, fecha_creada ASC LIMIT 1`
+        const [pend] = await poolRef.query(
+            "SELECT tipo, COUNT(*) n FROM bot_cola_envios WHERE estado = 'pendiente' GROUP BY tipo"
         );
-        return (r2 && r2[0]) || null;
+        if (!pend || !pend.length) return null;
+        const [ultimos] = await poolRef.query(
+            "SELECT tipo, MAX(fecha_envio) ult FROM bot_cola_envios WHERE estado = 'enviado' GROUP BY tipo"
+        );
+        const ultimoPorTipo = new Map();
+        for (const u of (ultimos || [])) ultimoPorTipo.set(u.tipo, new Date(u.ult).getTime() || 0);
+        let tipos = (pend || []).map(p => p.tipo);
+        if (tipos.length > 1 && ultimoTipo) tipos = tipos.filter(t => t !== ultimoTipo);
+        tipos.sort((a, b) => (ultimoPorTipo.get(a) || 0) - (ultimoPorTipo.get(b) || 0));
+        const tipo = tipos[0];
+        const [r] = await poolRef.query(
+            `SELECT * FROM bot_cola_envios
+             WHERE estado = 'pendiente' AND tipo = ?
+             ORDER BY prioridad ASC, fecha_creada ASC LIMIT 1`,
+            [tipo]
+        );
+        return (r && r[0]) || null;
     } catch (e) {
         return null;
     }

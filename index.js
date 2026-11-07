@@ -2397,14 +2397,12 @@ async function checkNuevasFacturas() {
 // ===== RECORDATORIOS DE FACTURAS VENCIDAS =====
 let recordatorioEjecutando = false;
 let primerEjecucionRecordatorio = true; // Evita disparar recordatorios al arrancar
-const MAX_RECORDATORIOS_POR_CICLO = 10; // Máximo recordatorios por cada ejecución diaria
+const MAX_RECORDATORIOS_POR_CICLO = 20; // Encola hasta 20 por día; la cola anti-baneo regula el ritmo
 
 function obtenerNivelRecordatorio(dias) {
-    if (dias >= 60) return 60;
-    if (dias >= 50) return 50;
-    if (dias >= 40) return 40;
-    if (dias >= 30) return 30;
-    return null;
+    if (dias < 30) return null;
+    // Recordatorio a los 30 días y luego cada 5 días (35, 40, 45...).
+    return 30 + Math.floor((dias - 30) / 5) * 5;
 }
 
 function obtenerTonoMensaje(nivel, f, monto, fecha, dias) {
@@ -2426,11 +2424,13 @@ async function checkFacturasVencidas() {
     }
     recordatorioEjecutando = true;
     try {
+        const excluidos = await automatizaciones.clientesExcluidosCobranza();
         const facturas = await notificador.obtenerFacturasVencidas();
         const enviados = await notificador.obtenerRecordatoriosEnviados();
         let cont = 0;
 
         for (const f of facturas) {
+            if (excluidos.has(Number(f.id_cliente))) continue;
             if (cont >= MAX_RECORDATORIOS_POR_CICLO) {
                 console.log(`[RECORDATORIO] Límite de ${MAX_RECORDATORIOS_POR_CICLO} alcanzado, el resto se enviará mañana.`);
                 break;
@@ -3258,7 +3258,41 @@ async function startBot() {
                 }
             }
 
-            // --- 0a3. CAMPAÑAS DE RECUPERACIÓN (ADMIN) ---
+            // --- 0a3. LISTA DE NO COBRAR (ADMIN) ---
+            if (isAdmin && (text === 'no cobrar' || text.startsWith('no cobrar '))) {
+                try {
+                    const resto = rawText.replace(/^no cobrar\s*/i, '').trim();
+                    if (!resto) {
+                        const { fijos, manuales } = await automatizaciones.listarNoCobrar();
+                        const cand = await automatizaciones.candidatosCobranza();
+                        let msg = `🚫 *CLIENTES SIN COBRANZA*\n\n`;
+                        msg += `*Fijos del sistema:*\n`;
+                        fijos.forEach(c => { msg += `• ${c.nombres} (${c.tipo || 's/tipo'})\n`; });
+                        if (manuales.length) {
+                            msg += `\n*Agregados manualmente:*\n`;
+                            manuales.forEach(c => { msg += `• ${c.nombres || 'ID ' + c.id_cliente} (id ${c.id_cliente})\n`; });
+                        }
+                        msg += `\n*Sí recibirían cobranza (${cand.length}):*\n`;
+                        cand.slice(0, 25).forEach(c => { msg += `• ${c.id_cliente} · ${c.nombres} · $${c.saldo} · ${c.dias}d\n`; });
+                        if (cand.length > 25) msg += `… y ${cand.length - 25} más.\n`;
+                        msg += `\nPara excluir: *no cobrar 1234* o *no cobrar NOMBRE*\nPara quitar: *no cobrar quitar 1234*`;
+                        return await safeSendMessage(from, { text: msg });
+                    }
+                    if (/^quitar\s+/i.test(resto)) {
+                        const quien = resto.replace(/^quitar\s+/i, '').trim();
+                        const c = await automatizaciones.quitarNoCobrar(quien);
+                        if (!c) return await safeSendMessage(from, { text: `No encontré un cliente que coincida con "*${quien}*".` });
+                        return await safeSendMessage(from, { text: `✅ *${c.nombres}* (id ${c.id_cliente}) vuelve a recibir recordatorios de cobranza.` });
+                    }
+                    const c = await automatizaciones.agregarNoCobrar(resto);
+                    if (!c) return await safeSendMessage(from, { text: `No encontré un cliente que coincida con "*${resto}*".` });
+                    return await safeSendMessage(from, { text: `🚫 *${c.nombres}* (id ${c.id_cliente}) agregado a la lista de NO cobranza.\n\nYa no recibirá recordatorios de facturas vencidas.` });
+                } catch (e) {
+                    return await safeSendMessage(from, { text: `❌ Error: ${e.message}` });
+                }
+            }
+
+            // --- 0a4. CAMPAÑAS DE RECUPERACIÓN (ADMIN) ---
             if (isAdmin && (text.startsWith('campana ') || text === 'campana' || text === 'resumen' || text.startsWith('campania '))) {
                 try {
                     if (text === 'resumen') {
@@ -5606,6 +5640,16 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-no-cobrar') {
+        try {
+            const { fijos, manuales } = await automatizaciones.listarNoCobrar();
+            const cand = await automatizaciones.candidatosCobranza();
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ fijos, manuales, candidatos: cand }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }, null, 2));
+        }
     } else if (routename === '/test-cola') {
         try {
             const estado = await colaEnvios.estado();

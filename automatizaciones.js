@@ -83,6 +83,12 @@ async function initTablas() {
         detalle TEXT NULL,
         UNIQUE KEY uq_fecha (fecha)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
+
+    await tabla(`CREATE TABLE IF NOT EXISTS bot_no_cobrar (
+        id_cliente INT PRIMARY KEY,
+        motivo VARCHAR(200) NULL,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
 }
 
 function nombreCorto(n) {
@@ -302,7 +308,7 @@ async function chequearCarrito() {
     );
     let n = 0;
     for (const i of intereses) {
-        const texto = `👋 Hola, le escribe *ONE4CARS*. Hace un par de días nos consultó por *${String(i.consulta || 'un repuesto').slice(0, 80)}* y queríamos saber si aún le interesa.\n\nSi desea, un asesor le confirma precio y disponibilidad hoy mismo. ¿Le ayudo? 🚗`;
+        const texto = `👋 Hola, le escribe *ONE4CARS*.\n\nHace un par de días revisamos su consulta sobre *${String(i.consulta || 'nuestro catálogo').slice(0, 80)}* y queríamos saber si desea que le enviemos la *lista de precios al mayor* o preparar una cotización para su negocio.\n\nRecuerde que trabajamos exclusivamente al mayor, con compra mínima de *USD 100*. ¿Le ayudo? 🚗`;
         const ok = await cola.encolar({ tipo: 'carrito', telefono: i.telefono, texto, prioridad: 4 });
         if (ok) {
             await poolRef.query("UPDATE bot_intereses SET contactado = 1 WHERE id = ?", [i.id]);
@@ -356,10 +362,80 @@ async function clientesExcluidosCobranza() {
         const rows = await q(
             `SELECT id_cliente FROM tab_clientes WHERE ${EXCLUSIONES_COBRANZA.join(' OR ')}`
         );
-        return new Set(rows.map(r => Number(r.id_cliente)));
+        const set = new Set(rows.map(r => Number(r.id_cliente)));
+        const manuales = await q("SELECT id_cliente FROM bot_no_cobrar");
+        for (const m of manuales) set.add(Number(m.id_cliente));
+        return set;
     } catch (e) {
         return new Set();
     }
+}
+
+async function listarNoCobrar() {
+    const fijos = await q(
+        `SELECT id_cliente, nombres, tipo FROM tab_clientes WHERE ${EXCLUSIONES_COBRANZA.join(' OR ')} ORDER BY nombres`
+    );
+    const manuales = await q(
+        `SELECT n.id_cliente, c.nombres, c.tipo, n.motivo, n.fecha
+         FROM bot_no_cobrar n LEFT JOIN tab_clientes c ON c.id_cliente = n.id_cliente
+         ORDER BY n.fecha DESC`
+    );
+    return { fijos, manuales };
+}
+
+async function agregarNoCobrar(texto) {
+    const t = String(texto || '').trim();
+    if (!t) return null;
+    let cliente = null;
+    if (/^\d+$/.test(t)) {
+        const r = await q("SELECT id_cliente, nombres, tipo FROM tab_clientes WHERE id_cliente = ? LIMIT 1", [parseInt(t, 10)]);
+        cliente = r[0] || null;
+    } else {
+        const r = await q(
+            "SELECT id_cliente, nombres, tipo FROM tab_clientes WHERE nombres LIKE ? ORDER BY nombres LIMIT 1",
+            [`%${t}%`]
+        );
+        cliente = r[0] || null;
+    }
+    if (!cliente) return null;
+    await poolRef.query(
+        "INSERT INTO bot_no_cobrar (id_cliente, motivo) VALUES (?, 'agregado por administrador') ON DUPLICATE KEY UPDATE motivo = VALUES(motivo)",
+        [cliente.id_cliente]
+    );
+    return cliente;
+}
+
+async function quitarNoCobrar(texto) {
+    const t = String(texto || '').trim();
+    if (!t) return null;
+    let cliente = null;
+    if (/^\d+$/.test(t)) {
+        const r = await q("SELECT id_cliente, nombres FROM tab_clientes WHERE id_cliente = ? LIMIT 1", [parseInt(t, 10)]);
+        cliente = r[0] || null;
+    } else {
+        const r = await q("SELECT id_cliente, nombres FROM tab_clientes WHERE nombres LIKE ? ORDER BY nombres LIMIT 1", [`%${t}%`]);
+        cliente = r[0] || null;
+    }
+    if (!cliente) return null;
+    await poolRef.query("DELETE FROM bot_no_cobrar WHERE id_cliente = ?", [cliente.id_cliente]);
+    return cliente;
+}
+
+async function candidatosCobranza() {
+    const excluidos = await clientesExcluidosCobranza();
+    const rows = await q(
+        `SELECT f.id_cliente, c.nombres, c.tipo, MAX(DATEDIFF(CURDATE(), f.fecha_reg)) dias,
+                ROUND(SUM((f.total - f.abono_factura)/(f.porcentaje||1)),2) saldo
+         FROM tab_facturas f
+         JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+         LEFT JOIN tab_vendedores v ON v.id_vendedor = f.id_vendedor
+         WHERE f.pagada = 'NO' AND f.anulado = 'no'
+           AND f.fecha_reg <= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+           AND (v.nombre IS NULL OR v.nombre != 'MANUEL FERRAZ')
+         GROUP BY f.id_cliente
+         ORDER BY saldo DESC`
+    );
+    return rows.filter(r => !excluidos.has(Number(r.id_cliente)));
 }
 
 // ===== 9. MENSAJES DE MUESTRA (solo pruebas) =====
@@ -373,7 +449,7 @@ function textoMuestra(tipo) {
         case 'aniversario':
             return `🎉 *¡FELIZ ANIVERSARIO, ${n}!* 🎉\n\nHoy celebramos *2 años* de trabajo conjunto. Gracias por su confianza y por permitirnos ser parte de su negocio.\n\nLe deseamos muchos éxitos más y seguimos a su disposición. 🚗\n\n— Equipo ONE4CARS`;
         case 'carrito':
-            return `👋 Hola, le escribe *ONE4CARS*. Hace un par de días nos consultó por *bujías para Corolla 2015* y queríamos saber si aún le interesa.\n\nSi desea, un asesor le confirma precio y disponibilidad hoy mismo. ¿Le ayudo? 🚗`;
+            return `👋 Hola, le escribe *ONE4CARS*.\n\nHace un par de días revisamos su consulta sobre *bujías para Corolla 2015* y queríamos saber si desea que le enviemos la *lista de precios al mayor* o preparar una cotización para su negocio.\n\nRecuerde que trabajamos exclusivamente al mayor, con compra mínima de *USD 100*. ¿Le ayudo? 🚗`;
         case 'visita':
             return `👋 Hola *${n}*, le saluda su asesor de *ONE4CARS*. Queremos coordinar una visita para conocer sus necesidades actuales y mostrarle las novedades del catálogo. ¿Qué día le queda cómodo esta semana? 🚗`;
         case 'fria':
@@ -396,5 +472,6 @@ module.exports = {
     chequearEncuestas, registrarRespuestaEncuesta,
     chequearAvisoVendedor, chequearAniversarios, chequearStockBajo,
     chequearFidelizacion, registrarInteres, chequearCarrito,
-    chequearVisitas15, clientesExcluidosCobranza, EXCLUSIONES_COBRANZA
+    chequearVisitas15, clientesExcluidosCobranza, EXCLUSIONES_COBRANZA,
+    listarNoCobrar, agregarNoCobrar, quitarNoCobrar, candidatosCobranza
 };
