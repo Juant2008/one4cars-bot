@@ -31,6 +31,17 @@ async function obtenerFacturasNoNotificadasCount() {
 }
 
 // ===== RECORDATORIOS POR VENCIMIENTO =====
+// Clientes que NO deben recibir mensajes de cobranza:
+// SAMY MOTORS, tipo SUPER, IMPORTACIONES JJ 8.1 y DAVERFREN.
+const EXCLUSION_COBRANZA = `
+           AND f.id_cliente NOT IN (
+               SELECT id_cliente FROM tab_clientes
+               WHERE nombres LIKE '%SAMY MOTORS%'
+                  OR tipo = 'SUPER'
+                  OR nombres LIKE '%IMPORTACIONES JJ 8.1%'
+                  OR nombres LIKE '%DAVERFREN%'
+           )`;
+
 async function obtenerFacturasVencidas() {
     const conn = await mysql.createConnection(dbConfig);
     const [rows] = await conn.execute(
@@ -45,6 +56,7 @@ async function obtenerFacturasVencidas() {
            AND f.fecha_reg <= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
            AND (c.cliente_oficina IS NULL OR c.cliente_oficina != 'SI')
            AND (v.nombre IS NULL OR v.nombre != 'OFICINA')  AND (v.nombre IS NULL OR v.nombre != 'MANUEL FERRAZ') -- FILTRO SOLICITADO
+           ${EXCLUSION_COBRANZA}
          ORDER BY f.fecha_reg ASC`
     );
     await conn.end();

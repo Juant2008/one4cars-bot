@@ -239,6 +239,8 @@ const catalogoTecnico = require('./catalogo_tecnico');
 const reportesIA = require('./reportes_ia');
 const licencia = require('./licencia');
 const campanias = require('./campanias');
+const colaEnvios = require('./cola_envios');
+const automatizaciones = require('./automatizaciones');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
@@ -263,10 +265,23 @@ const pool = mysql.createPool({
 catalogoTecnico.init(pool);
 reportesIA.init(pool);
 licencia.init(pool);
+automatizaciones.init(pool, {
+    enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
+    format: formatWhatsApp,
+    avisarAdmins: async (texto) => {
+        for (const id of ADMIN_IDS) {
+            try { await safeSendMessage(formatWhatsApp(id), { text: texto }); } catch (e) {}
+        }
+    }
+});
 campanias.init(pool, {
     enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
     format: formatWhatsApp
 });
+colaEnvios.initCompleto(pool, {
+    enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
+    format: formatWhatsApp
+}).then(() => automatizaciones.initTablas()).catch(e => console.log('[COLA] Init:', e.message));
 const poolLocal = mysql.createPool({
     host: process.env.LOCAL_DB_HOST || '127.0.0.1',
     user: process.env.LOCAL_DB_USER || process.env.DB_USER || 'juant200_one4car',
@@ -2148,6 +2163,7 @@ async function responderProductosIA(from, busqueda) {
     try {
         const oem = await catalogoTecnico.buscarPorOEM(consulta);
         if (oem && oem.productos && oem.productos.length) {
+            automatizaciones.registrarInteres(from, consulta);
             return await enviarResultadosCompatibles(from, {
                 productos: oem.productos,
                 mensaje: `🔎 *Código ${oem.codigos.join(', ')}*`
@@ -2159,6 +2175,7 @@ async function responderProductosIA(from, busqueda) {
     try {
         const compat = await catalogoTecnico.buscarCompatibles(consulta);
         if (compat) {
+            automatizaciones.registrarInteres(from, consulta);
             const manejado = await enviarResultadosCompatibles(from, compat);
             if (manejado) return true;
         }
@@ -2175,6 +2192,7 @@ async function responderProductosIA(from, busqueda) {
     if (!prods || !prods.length) {
         return await responderRouter(from, `No encontré una coincidencia exacta para "*${consulta.slice(0, 80)}*" en el inventario.\n\nPara confirmar precio y disponibilidad, indíqueme:\n• Pieza\n• Marca, modelo y año del vehículo\n• Cantidad\n\nTambién puede consultar el catálogo: https://www.one4cars.com/consulta_productos.php/`);
     }
+    automatizaciones.registrarInteres(from, consulta);
     const pct = await obtenerPorcentaje();
     if (prods.length > 1) {
         let msg = `🔎 *Resultados para "${consulta.slice(0, 80)}"*\n\n`;
@@ -2433,11 +2451,12 @@ async function checkFacturasVencidas() {
                 const jid = formatWhatsApp(f.celular);
                 if (jid) {
                     const msg = obtenerTonoMensaje(nivel, f, monto, fecha, dias);
-                    await safeSendMessage(jid, { text: msg });
+                    const ok = await colaEnvios.encolar({ tipo: 'cobranza', telefono: f.celular, nombre: f.nombres, texto: msg, prioridad: 2 });
+                    if (ok) {
+                        await notificador.marcarRecordatorio(f.id_factura, nivel);
+                        cont++;
+                    }
                 }
-                await notificador.marcarRecordatorio(f.id_factura, nivel);
-                cont++;
-                await humanDelay(25, 50); // Delay más largo entre recordatorios
             }
         }
 
@@ -3066,6 +3085,22 @@ async function startBot() {
 
             await guardarMensaje(from, 'user', rawText);
 
+            // Respuesta a encuesta de satisfacción (1 al 5)
+            if (!isAdmin && /^[1-5]$/.test(rawText.trim())) {
+                const telResp = String(msg.key.senderPn || msg.key.remoteJidAlt || from).split('@')[0];
+                const okEnc = await automatizaciones.registrarRespuestaEncuesta(telResp, rawText.trim());
+                if (okEnc) {
+                    const v = parseInt(rawText.trim(), 10);
+                    const gracias = v >= 4
+                        ? '¡Muchas gracias por su valoración! Nos alegra saber que tuvo una buena experiencia. 🙌'
+                        : 'Gracias por su sinceridad. Tomaremos su opinión muy en cuenta para mejorar. 🙏';
+                    const msgEnc = `⭐ *ENCUESTA REGISTRADA*\n\nSu calificación: *${v}/5*\n\n${gracias}\n\n— Equipo ONE4CARS`;
+                    await safeSendMessage(from, { text: msgEnc });
+                    try { await guardarMensaje(from, 'model', msgEnc); } catch (e) {}
+                    return;
+                }
+            }
+
             // Ignorar auto-reply de clientes (mensajes automáticos de bienvenida)
             const rawLower = rawText.toLowerCase();
             const esAutoReplyCliente = AUTO_REPLY_CLIENTE.some(f => rawLower.includes(f));
@@ -3200,7 +3235,30 @@ async function startBot() {
                 }
             }
 
-            // --- 0a2. CAMPAÑAS DE RECUPERACIÓN (ADMIN) ---
+            // --- 0a2. COLA ANTI-BANEO (ADMIN) ---
+            if (isAdmin && (text === 'cola' || text.startsWith('cola '))) {
+                try {
+                    const cmd = colaEnvios.comando(text);
+                    if (!cmd) {
+                        return await safeSendMessage(from, { text: 'Uso:\n• *cola* → estado\n• *cola pausa* / *cola reanudar*\n• *cola intervalo 30*\n• *cola diario 5*\n• *cola horario 8 18*\n• *cola prueba* / *cola real*\n• *cola vaciar*' });
+                    }
+                    if (cmd.accion === 'estado') {
+                        return await safeSendMessage(from, { text: await colaEnvios.estado() });
+                    }
+                    if (cmd.accion === 'config') {
+                        await colaEnvios.aplicar(cmd.cambios);
+                        return await safeSendMessage(from, { text: `✅ Cola actualizada.\n\n${await colaEnvios.estado()}` });
+                    }
+                    if (cmd.accion === 'vaciar') {
+                        const n = await colaEnvios.vaciar();
+                        return await safeSendMessage(from, { text: `🧹 Cola vaciada: *${n}* mensaje(s) pendientes eliminados.` });
+                    }
+                } catch (e) {
+                    return await safeSendMessage(from, { text: `❌ Error de cola: ${e.message}` });
+                }
+            }
+
+            // --- 0a3. CAMPAÑAS DE RECUPERACIÓN (ADMIN) ---
             if (isAdmin && (text.startsWith('campana ') || text === 'campana' || text === 'resumen' || text.startsWith('campania '))) {
                 try {
                     if (text === 'resumen') {
@@ -3218,7 +3276,7 @@ async function startBot() {
                         const r = await campanias.enviarFria({ dias, limite, soloSimular });
                         let msg = `${soloSimular ? '👀 *SIMULACIÓN DE CAMPAÑA FRÍA*' : '🚀 *CAMPAÑA FRÍA ENVIADA*'}\n\n`;
                         msg += `• Clientes fríos encontrados: *${r.totalFrios}*\n`;
-                        msg += `• ${soloSimular ? 'A enviar' : 'Mensajes enviados'}: *${soloSimular ? r.mensajes.length : r.enviados}*\n`;
+                        msg += `• ${soloSimular ? 'A encolar' : 'Mensajes en cola'}: *${soloSimular ? r.mensajes.length : r.encolados}*\n`;
                         msg += `• Omitidos (ya contactados en 45 días): *${r.omitidosPorDuplicado}*\n`;
                         if (soloSimular && r.mensajes.length) {
                             msg += `\n*Primer mensaje:*\n${r.mensajes[0].texto.slice(0, 400)}`;
@@ -3232,7 +3290,7 @@ async function startBot() {
                         const r = await campanias.enviarLeads({ horas, limite, soloSimular });
                         let msg = `${soloSimular ? '👀 *SIMULACIÓN DE SEGUIMIENTO DE LEADS*' : '🚀 *SEGUIMIENTO DE LEADS ENVIADO*'}\n\n`;
                         msg += `• Interesados encontrados: *${r.encontrados}*\n`;
-                        msg += `• ${soloSimular ? 'A enviar' : 'Mensajes enviados'}: *${soloSimular ? r.mensajes.length : r.enviados}*\n`;
+                        msg += `• ${soloSimular ? 'A encolar' : 'Mensajes en cola'}: *${soloSimular ? r.mensajes.length : r.encolados}*\n`;
                         if (soloSimular && r.mensajes.length) msg += `\n*Primer mensaje:*\n${r.mensajes[0].texto.slice(0, 400)}`;
                         return await safeSendMessage(from, { text: msg });
                     }
@@ -5235,16 +5293,15 @@ const server = http.createServer(async (req, res) => {
                 const data = JSON.parse(b);
                 const ids = data.clientes || [];
                 if (ids.length === 0) { res.end("Ningún cliente seleccionado."); return; }
-                res.end(`✅ Envío iniciado para ${ids.length} cliente(s).`);
+                res.end(`✅ ${ids.length} recordatorio(s) enviados a la cola anti-baneo.`);
                 setTimeout(async () => {
                     let cont = 0;
-                    const bs = sendConfig.batchSize;
-                    const pb = sendConfig.pauseBatch;
+                    const excluidos = await automatizaciones.clientesExcluidosCobranza();
                     for (let i = 0; i < ids.length; i++) {
-                        if (i > 0 && i % bs === 0) { console.log(`[REC ESTADO] Pausa ${pb/60000}min lote ${i}/${ids.length}...`); await sleep(pb); }
-                        const [clientes] = await pool.execute("SELECT id_cliente, nombres, celular FROM tab_clientes WHERE id_cliente = ?", [ids[i]]);
+                        const [clientes] = await pool.execute("SELECT id_cliente, nombres, celular, tipo FROM tab_clientes WHERE id_cliente = ?", [ids[i]]);
                         const c = clientes[0];
                         if (!c) continue;
+                        if (excluidos.has(Number(c.id_cliente))) continue;
                         const [facturas] = await pool.execute("SELECT nro_factura, total, abono_factura, porcentaje, DATEDIFF(CURDATE(), fecha_reg) as dias FROM tab_facturas WHERE id_cliente = ? AND pagada='NO' AND anulado='no' ORDER BY fecha_reg ASC LIMIT 1", [c.id_cliente]);
                         const f = facturas[0];
                         const notaStr = f ? `#${f.nro_factura}` : 'pendiente';
@@ -5255,11 +5312,10 @@ const server = http.createServer(async (req, res) => {
                         if (!jid) continue;
                         const tpl = pickTemplate(MESSAGE_TEMPLATES.recordatorioEstado);
                         const msg = tpl(c.nombres, notaStr, divisas.toFixed(2), diasStr, bcv.toFixed(2));
-                        await safeSendMessage(jid, { text: msg });
-                        cont++;
-                        await humanDelay(25, 50);
+                        const ok = await colaEnvios.encolar({ tipo: 'cobranza', telefono: c.celular, nombre: c.nombres, texto: msg, prioridad: 2 });
+                        if (ok) cont++;
                     }
-                    console.log(`[RECORDATORIO ESTADO] ${cont}/${ids.length} enviado(s).`);
+                    console.log(`[RECORDATORIO ESTADO] ${cont}/${ids.length} en cola.`);
                 }, 500);
             } catch (e) { res.end("Error: " + e.message); }
         });
@@ -5271,16 +5327,10 @@ const server = http.createServer(async (req, res) => {
                 const data = JSON.parse(b);
                 const ids = data.clientes || [];
                 if (ids.length === 0) { res.end("Ningún cliente seleccionado."); return; }
-                res.end(`✅ Envío iniciado para ${ids.length} cliente(s).`);
+                res.end(`✅ ${ids.length} recordatorio(s) de visita enviados a la cola anti-baneo.`);
                 setTimeout(async () => {
                     let cont = 0;
-                    const bs = sendConfig.batchSize;
-                    const pb = sendConfig.pauseBatch;
-                    const lunes = new Date();
-                    lunes.setDate(lunes.getDate() - ((lunes.getDay() + 6) % 7));
-                    const semanaInicio = lunes.toISOString().split('T')[0];
                     for (let i = 0; i < ids.length; i++) {
-                        if (i > 0 && i % bs === 0) { console.log(`[REC VISITA] Pausa ${pb/60000}min lote ${i}/${ids.length}...`); await sleep(pb); }
                         const [clientes] = await pool.execute("SELECT id_cliente, nombres, celular FROM tab_clientes WHERE id_cliente = ?", [ids[i]]);
                         const c = clientes[0];
                         if (!c) continue;
@@ -5288,12 +5338,13 @@ const server = http.createServer(async (req, res) => {
                         if (!jid) continue;
                         const tpl = pickTemplate(MESSAGE_TEMPLATES.recordatorioVisita);
                         const msg = tpl(c.nombres);
-                        await safeSendMessage(jid, { text: msg });
-                        await dualExecute("INSERT IGNORE INTO recordatorio_visita_log (id_cliente, semana_inicio) VALUES (?, ?)", [c.id_cliente, semanaInicio]);
-                        cont++;
-                        await humanDelay(25, 50);
+                        const ok = await colaEnvios.encolar({ tipo: 'visita', telefono: c.celular, nombre: c.nombres, texto: msg, prioridad: 5 });
+                        if (ok) {
+                            await pool.execute("INSERT INTO bot_visita15_log (id_cliente, fecha_envio) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE fecha_envio = NOW()", [c.id_cliente]);
+                            cont++;
+                        }
                     }
-                    console.log(`[RECORDATORIO VISITA] ${cont}/${ids.length} enviado(s).`);
+                    console.log(`[RECORDATORIO VISITA] ${cont}/${ids.length} en cola.`);
                 }, 500);
             } catch (e) { res.end("Error: " + e.message); }
         });
@@ -5305,11 +5356,10 @@ const server = http.createServer(async (req, res) => {
             setTimeout(async () => {
                 const [todos] = await pool.execute("SELECT DISTINCT c.id_cliente, c.nombres, c.celular FROM tab_clientes c JOIN tab_facturas f ON c.id_cliente = f.id_cliente WHERE f.pagada='NO' AND f.anulado='no' AND c.activo='si'");
                 let cont = 0;
-                const bs = sendConfig.batchSize;
-                const pb = sendConfig.pauseBatch;
+                const excluidos = await automatizaciones.clientesExcluidosCobranza();
                 for (let i = 0; i < todos.length; i++) {
-                    if (i > 0 && i % bs === 0) { console.log(`[REC ESTADO] Pausa ${pb/60000}min lote ${i}/${todos.length}...`); await sleep(pb); }
                     const c = todos[i];
+                    if (excluidos.has(Number(c.id_cliente))) continue;
                     const [facturas] = await pool.execute("SELECT nro_factura, total, abono_factura, porcentaje, DATEDIFF(CURDATE(), fecha_reg) as dias FROM tab_facturas WHERE id_cliente = ? AND pagada='NO' AND anulado='no' ORDER BY fecha_reg ASC LIMIT 1", [c.id_cliente]);
                     const f = facturas[0];
                     const notaStr = f ? `#${f.nro_factura}` : 'pendiente';
@@ -5320,11 +5370,10 @@ const server = http.createServer(async (req, res) => {
                     if (!jid) continue;
                     const tpl = pickTemplate(MESSAGE_TEMPLATES.recordatorioEstado);
                     const msg = tpl(c.nombres, notaStr, divisas.toFixed(2), diasStr, bcv.toFixed(2));
-                    await safeSendMessage(jid, { text: msg });
-                    cont++;
-                    await humanDelay(25, 50);
+                    const ok = await colaEnvios.encolar({ tipo: 'cobranza', telefono: c.celular, nombre: c.nombres, texto: msg, prioridad: 2 });
+                    if (ok) cont++;
                 }
-                console.log(`[RECORDATORIO ESTADO] Forzado: ${cont} enviado(s).`);
+                console.log(`[RECORDATORIO ESTADO] Forzado: ${cont} en cola.`);
             }, 500);
             return;
         }
@@ -5557,6 +5606,62 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-cola') {
+        try {
+            const estado = await colaEnvios.estado();
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ estado, config: colaEnvios.config }, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-mensaje') {
+        try {
+            if (!isBotReady()) {
+                res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'bot no conectado' }));
+            }
+            const tipo = (query.tipo || 'encuesta').toLowerCase();
+            const texto = automatizaciones.textoMuestra(tipo);
+            if (!texto) {
+                res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'tipo no válido' }));
+            }
+            const destino = formatWhatsApp('584123715550');
+            await safeSendMessage(destino, { text: texto });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, tipo, destino }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-cola-tick') {
+        try {
+            const forzar = query.forzar === '1';
+            const ignorarIntervalo = query.intervalo === '0';
+            await colaEnvios.tick({ forzar, ignorarIntervalo });
+            const est = await colaEnvios.estado();
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, forzar, ignorarIntervalo, estado: est }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-colacola') {
+        try {
+            const tipo = (query.tipo || 'encuesta').toLowerCase();
+            const texto = automatizaciones.textoMuestra(tipo);
+            if (!texto) {
+                res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'tipo no válido' }));
+            }
+            const ok = await colaEnvios.encolar({ tipo, telefono: '584123715550', nombre: 'PRUEBA', texto, prioridad: 1 });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok, tipo, enCola: ok }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
     } else if (routename === '/test-mayorista') {
         try {
             const from = query.from || '584140000000@s.whatsapp.net';
@@ -6379,15 +6484,55 @@ server.listen(PORT, process.env.BIND_HOST || '0.0.0.0', async () => {
     actualizarDolar();
     setInterval(actualizarDolar, 3600000);
 
-    // Resumen diario automático a los administradores (18:00 Caracas).
-    let resumenEnviadoHoy = '';
+    // ===== PROGRAMADOR ANTI-BANEO =====
+    // 1 mensaje cada 30 min, máximo 5/día, solo lunes a viernes 8:00-18:00.
+    // Modo prueba: todo va a 584123715550 hasta que se autorice.
+    setInterval(() => colaEnvios.tick().catch(e => console.log('[COLA] Error:', e.message)), 60 * 1000);
+
+    const esFinDeSemana = () => {
+        const { diaSemana } = colaEnvios.ahoraCaracas();
+        return diaSemana === 0 || diaSemana === 6;
+    };
+    const hoyCaracas = () => {
+        const { fecha } = colaEnvios.ahoraCaracas();
+        return fecha;
+    };
+    let ultimoDiaAutomatizaciones = '';
+    let ultimoDiaResumen = '';
+
+    setInterval(async () => {
+        if (!isBotReady() || esFinDeSemana()) return;
+        try {
+            // Estas revisiones solo encolan; la cola decide cuándo salen.
+            await automatizaciones.chequearEncuestas();
+            await automatizaciones.chequearAvisoVendedor();
+            await automatizaciones.chequearAniversarios();
+            await automatizaciones.chequearCarrito();
+        } catch (e) { console.log('[AUTO] Error ciclo:', e.message); }
+    }, 30 * 60 * 1000);
+
+    setInterval(async () => {
+        if (!isBotReady()) return;
+        const { hora, diaSemana, fecha } = colaEnvios.ahoraCaracas();
+        if (diaSemana === 0 || diaSemana === 6) return;
+        try {
+            // Avisos internos (admin) y tareas del día, una vez al día a las 9:00.
+            if (hora === 9 && ultimoDiaAutomatizaciones !== fecha) {
+                ultimoDiaAutomatizaciones = fecha;
+                await automatizaciones.chequearStockBajo();
+                await automatizaciones.chequearFidelizacion();
+                await automatizaciones.chequearVisitas15();
+            }
+        } catch (e) { console.log('[AUTO] Error diario:', e.message); }
+    }, 60 * 1000);
+
+    // Resumen diario automático a los administradores (17:45 Caracas, días hábiles).
     setInterval(async () => {
         try {
-            const ahora = new Date().toLocaleString('es-VE', { timeZone: 'America/Caracas', hour12: false, hour: '2-digit', minute: '2-digit' });
-            const fechaHoy = new Date().toLocaleDateString('es-VE', { timeZone: 'America/Caracas' });
-            const [hh, mm] = ahora.split(':').map(Number);
-            if (hh === 18 && mm < 15 && resumenEnviadoHoy !== fechaHoy && isBotReady()) {
-                resumenEnviadoHoy = fechaHoy;
+            const { hora, minuto, fecha, diaSemana } = colaEnvios.ahoraCaracas();
+            if (diaSemana === 0 || diaSemana === 6) return;
+            if (hora === 17 && minuto >= 45 && minuto < 59 && ultimoDiaResumen !== fecha && isBotReady()) {
+                ultimoDiaResumen = fecha;
                 const texto = await campanias.resumenDiario();
                 for (const id of ADMIN_IDS) {
                     try { await safeSendMessage(formatWhatsApp(id), { text: texto }); } catch (e) {}

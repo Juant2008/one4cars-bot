@@ -4,8 +4,10 @@
  * - enviarFria: mensaje personalizado con control de duplicados (bot_campania_log).
  * - enviarLeads: seguimiento a interesados que no completaron registro/pedido.
  * - resumenDiario: digest natural para los administradores.
+ *
+ * Todos los mensajes a clientes entran por cola_envios (anti-baneo).
  */
-const axios = require('axios');
+const cola = require('./cola_envios');
 
 let poolRef = null;
 let enviarRef = null;   // async (jid, texto) => void
@@ -116,7 +118,7 @@ async function enviarFria({ dias = 60, limite = 20, soloSimular = false, plantil
     seleccion.push({ ...c, tel });
   }
 
-  const resultado = { campania: 'fria', dias, totalFrios: clientes.length, enviados: 0, omitidosPorDuplicado: omitidos.length, simulado: !!soloSimular, mensajes: [] };
+  const resultado = { campania: 'fria', dias, totalFrios: clientes.length, enviados: 0, omitidosPorDuplicado: omitidos.length, encolados: 0, simulado: !!soloSimular, mensajes: [] };
 
   for (const c of seleccion) {
     const texto = textoFria(c, plantilla);
@@ -125,10 +127,11 @@ async function enviarFria({ dias = 60, limite = 20, soloSimular = false, plantil
     const jid = formatRef(c.tel);
     if (!jid) continue;
     try {
-      await enviarRef(jid, texto);
-      await registrarEnvio('fria', c.tel);
-      resultado.enviados += 1;
-      await new Promise(r => setTimeout(r, 4000)); // ritmo humano
+      const ok = await cola.encolar({ tipo: 'fria', telefono: c.tel, nombre: c.nombres, texto, prioridad: 5 });
+      if (ok) {
+        await registrarEnvio('fria', c.tel);
+        resultado.encolados += 1;
+      }
     } catch (e) {
       resultado.mensajes[resultado.mensajes.length - 1].error = e.message;
     }
@@ -143,7 +146,7 @@ async function enviarLeads({ horas = 24, limite = 20, soloSimular = false }) {
      ORDER BY fecha DESC LIMIT ?`,
     [Number(horas) || 24, Number(limite) || 20]
   );
-  const resultado = { campania: 'leads', horas, encontrados: (rows || []).length, enviados: 0, simulado: !!soloSimular, mensajes: [] };
+  const resultado = { campania: 'leads', horas, encontrados: (rows || []).length, enviados: 0, encolados: 0, simulado: !!soloSimular, mensajes: [] };
 
   for (const l of (rows || [])) {
     const tel = String(l.telefono || '').trim();
@@ -166,10 +169,11 @@ Recuerde que la compra mínima es de *USD 100*. Un asesor validará sus datos y 
     const jid = formatRef(tel);
     if (!jid) continue;
     try {
-      await enviarRef(jid, texto);
-      await poolRef.query("UPDATE bot_leads SET estado = 'seguimiento' WHERE id = ?", [l.id]);
-      resultado.enviados += 1;
-      await new Promise(r => setTimeout(r, 4000));
+      const ok = await cola.encolar({ tipo: 'leads', telefono: tel, nombre: l.nombre, texto, prioridad: 4 });
+      if (ok) {
+        await poolRef.query("UPDATE bot_leads SET estado = 'seguimiento' WHERE id = ?", [l.id]);
+        resultado.encolados += 1;
+      }
     } catch (e) {
       resultado.mensajes[resultado.mensajes.length - 1].error = e.message;
     }
