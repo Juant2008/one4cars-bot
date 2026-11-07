@@ -40,7 +40,7 @@ async function obtenerListaDeudores(filtros) {
             c.celular, 
             c.vendedor, 
             c.zona, 
-            SUM((f.total - f.abono_factura) / (f.porcentaje || 1)) as saldo_total,
+            SUM(f.total - f.abono_factura) as saldo_total,
             COUNT(f.id_factura) as cantidad_facturas
         FROM tab_clientes c
         JOIN tab_facturas f ON c.id_cliente = f.id_cliente

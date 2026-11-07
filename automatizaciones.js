@@ -425,7 +425,7 @@ async function candidatosCobranza() {
     const excluidos = await clientesExcluidosCobranza();
     const rows = await q(
         `SELECT f.id_cliente, c.nombres, c.tipo, MAX(DATEDIFF(CURDATE(), f.fecha_reg)) dias,
-                ROUND(SUM((f.total - f.abono_factura)/(f.porcentaje||1)),2) saldo
+                ROUND(SUM(f.total - f.abono_factura),2) saldo
          FROM tab_facturas f
          JOIN tab_clientes c ON c.id_cliente = f.id_cliente
          LEFT JOIN tab_vendedores v ON v.id_vendedor = f.id_vendedor

@@ -1166,7 +1166,7 @@ async function resumenCarteraVendedor(idVendedor) {
         const [porCliente] = await pool.execute(
             `SELECT c.id_cliente, c.nombres,
                     COUNT(f.id_factura) facturas,
-                    ROUND(SUM((f.total - f.abono_factura) / (f.porcentaje || 1)), 2) saldo,
+                    ROUND(SUM(f.total - f.abono_factura), 2) saldo,
                     MAX(DATEDIFF(CURDATE(), f.fecha_reg)) dias
              FROM tab_facturas f
              JOIN tab_clientes c ON c.id_cliente = f.id_cliente
@@ -1176,7 +1176,7 @@ async function resumenCarteraVendedor(idVendedor) {
             [idVendedor]
         );
         const [tot] = await pool.execute(
-            `SELECT COUNT(*) facturas, ROUND(SUM((total - abono_factura) / (porcentaje || 1)), 2) saldo
+            `SELECT COUNT(*) facturas, ROUND(SUM(total - abono_factura), 2) saldo
              FROM tab_facturas WHERE id_vendedor = ? AND pagada = 'NO' AND anulado = 'no'`,
             [idVendedor]
         );
@@ -1216,6 +1216,21 @@ function formatoBs(n) {
     return Number(n || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// El RIF real está en el campo cedula (ej. J301685067 → J-301685067).
+function formatoRif(c) {
+    if (!c) return '—';
+    const raw = String(c.cedula || c.clave || '').trim().toUpperCase();
+    if (!raw) return '—';
+    const m = raw.match(/^([VEJGP])-?\s*(\d+)$/);
+    if (m) return `${m[1]}-${m[2]}`;
+    return raw;
+}
+
+function telValido(v) {
+    const d = String(v || '').replace(/\D/g, '');
+    return d.length >= 7 ? String(v).trim() : '—';
+}
+
 function linkReporteFactura(f) {
     const fReg = new Date(f.fecha_reg).toISOString().split('T')[0];
     const params = `id_factura=${f.id_factura}&nro_factura=${f.nro_factura}&fecha_reg=${fReg}&total=${f.total}&abono_factura=${f.abono_factura}&nombres=${encodeURIComponent((f.nombres || '').trim())}&nombre=${encodeURIComponent((f.nombre_vendedor || '').trim())}&direccion=${encodeURIComponent((f.direccion || '').trim())}&cedula=${(f.cedula || '').trim()}&celular=${encodeURIComponent((f.celular || '').trim())}&telefono=${encodeURIComponent((f.telefono || '').trim())}&id_cliente=${f.id_cliente}&zona=${encodeURIComponent((f.zona || '').trim())}&descuento=${f.descuento}&total_desc=${f.total_desc}`;
@@ -1241,10 +1256,14 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             await safeSendMessage(from, { text: `❌ No encontré la factura *${m[1]}*. Verifique el número.` });
             return true;
         }
-        const monto = (parseFloat(f.total) - parseFloat(f.abono_factura || 0)) / (parseFloat(f.porcentaje) || 1);
+        const pct = parseFloat(f.porcentaje) || 1;
+        const totalUsd = parseFloat(f.total || 0) / pct;
+        const abonoUsd = parseFloat(f.abono_factura || 0) / pct;
+        const pagada = String(f.pagada || '').toUpperCase() === 'SI';
+        const saldoUsd = pagada ? 0 : Math.max(0, totalUsd - abonoUsd);
         const fReg = new Date(f.fecha_reg).toISOString().split('T')[0];
         const firmada = `https://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg`;
-        await safeSendMessage(from, { text: `🧾 *FACTURA #${f.nro_factura}*\n\n👤 Cliente: *${f.nombres}*\n📅 Fecha: ${fReg}\n💰 Saldo: *$${monto.toFixed(2)}*\n📌 Estado: ${String(f.pagada || '').toUpperCase() === 'SI' ? 'Pagada' : 'Pendiente'}${String(f.anulado || '').toLowerCase() === 'si' ? ' · ANULADA' : ''}\n\n✍️ *Factura firmada:*\n${firmada}\n\n📄 *Reporte completo:*\n${linkReporteFactura(f)}` });
+        await safeSendMessage(from, { text: `🧾 *FACTURA #${f.nro_factura}*\n\n👤 Cliente: *${f.nombres}*\n📅 Fecha: ${fReg}\n💰 Total: *$${totalUsd.toFixed(2)}*\n💰 Saldo pendiente: *$${saldoUsd.toFixed(2)}*\n📌 Estado: ${pagada ? 'Pagada' : 'Pendiente'}${String(f.anulado || '').toLowerCase() === 'si' ? ' · ANULADA' : ''}\n\n✍️ *Factura firmada:*\n${firmada}\n\n📄 *Reporte completo:*\n${linkReporteFactura(f)}` });
         return true;
     }
 
@@ -1281,19 +1300,53 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             const term = mEc[1].replace(/[?.!]+$/g, '').trim();
             const clientes = await buscarClientesPorNombre(term);
             if (!clientes.length) {
-                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                // ¿Será un vendedor? Mostrar su cartera.
+                const vend = await buscarVendedorPorNombre(term);
+                if (vend) {
+                    const resumen = await resumenCarteraVendedor(vend.id_vendedor);
+                    let mv = `📊 *CARTERA DEL VENDEDOR*\n\n🧑‍💼 *${vend.nombre}*\n`;
+                    if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
+                    mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
+                    if (resumen.detalle.length) {
+                        mv += `\n*Clientes con mayor saldo:*\n`;
+                        resumen.detalle.slice(0, 12).forEach((c, i) => {
+                            mv += `${i + 1}. ${c.nombres} — *$${formatoBs(c.saldo)}* (${c.dias}d)\n`;
+                        });
+                    }
+                    await safeSendMessage(from, { text: mv.trim() });
+                    return true;
+                }
+                await safeSendMessage(from, { text: `❌ No encontré un cliente ni un vendedor que coincida con "*${term}*".` });
                 return true;
             }
             const c = clientes[0];
+            if (String(c.tipo || '').toUpperCase() === 'VENDEDOR') {
+                const vend = await buscarVendedorPorNombre(c.nombres);
+                if (vend) {
+                    const resumen = await resumenCarteraVendedor(vend.id_vendedor);
+                    let mv = `📊 *CARTERA DEL VENDEDOR*\n\n🧑‍💼 *${vend.nombre}*\n`;
+                    if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
+                    mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
+                    if (resumen.detalle.length) {
+                        mv += `\n*Clientes con mayor saldo:*\n`;
+                        resumen.detalle.slice(0, 12).forEach((d, i) => {
+                            mv += `${i + 1}. ${d.nombres} — *$${formatoBs(d.saldo)}* (${d.dias}d)\n`;
+                        });
+                        if (resumen.detalle.length > 12) mv += `… y ${resumen.detalle.length - 12} más.\n`;
+                    }
+                    await safeSendMessage(from, { text: mv.trim() });
+                    return true;
+                }
+            }
             const facturas = await facturasPendientesCliente(c.id_cliente);
-            let msg = `📊 *ESTADO DE CUENTA*\n\n👤 *${c.nombres}*\n🆔 RIF: ${c.clave || '—'}\n🧑‍💼 Vendedor: ${c.vendedor || '—'}\n🏷️ Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
+            let msg = `📊 *ESTADO DE CUENTA*\n\n👤 *${c.nombres}*\n🆔 RIF: ${formatoRif(c)}\n🧑‍💼 Vendedor: ${c.vendedor || '—'}\n🏷️ Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
             if (!facturas.length) {
                 msg += `\n✅ Sin facturas pendientes. Cuenta al día.`;
             } else {
                 let total = 0;
                 msg += `\n*Facturas pendientes (${facturas.length}):*\n`;
                 facturas.slice(0, 10).forEach((f, i) => {
-                    const saldo = (parseFloat(f.total) - parseFloat(f.abono_factura || 0)) / (parseFloat(f.porcentaje) || 1);
+                    const saldo = Math.max(0, parseFloat(f.total) - parseFloat(f.abono_factura || 0));
                     total += saldo;
                     msg += `\n*${i + 1}. #${f.nro_factura}* · ${new Date(f.fecha_reg).toISOString().split('T')[0]} · ${f.dias}d · *$${formatoBs(saldo)}*\n✍️ https://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg\n`;
                 });
@@ -1349,27 +1402,49 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             return true;
         }
 
-        // 2e) Datos generales de un cliente
-        const mDato = t.match(/(tel[eé]fono|celular|rif|c[eé]dula|cedula|direcci[oó]n|vendedor|zona|datos|todo)\s*(?:de|del|para)\s+(.+)/i);
-        if (mDato) {
-            const term = mDato[2].replace(/[?.!]+$/g, '').trim();
+        // 2e) Datos generales de un cliente (todos los campos pedidos)
+        const campos = [];
+        if (/tel[eé]fono/i.test(t)) campos.push('telefono');
+        if (/celular/i.test(t)) campos.push('celular');
+        if (/\brif\b/i.test(t)) campos.push('rif');
+        if (/c[eé]dula|cedula/i.test(t)) campos.push('cedula');
+        if (/direcci[oó]n/i.test(t)) campos.push('direccion');
+        if (/\bvendedor\b/i.test(t)) campos.push('vendedor');
+        if (/\bzona\b/i.test(t)) campos.push('zona');
+        if (/\btipo\b/i.test(t)) campos.push('tipo');
+        if (/\b(datos|todo|informaci[oó]n)\b/i.test(t)) campos.push('todo');
+        const empiezaCampo = /^\s*(?:el\s+|la\s+|los\s+|las\s+)?(?:tel[eé]fono|celular|rif|c[eé]dula|direcci[oó]n|vendedor|zona|tipo|datos|todo)\b/i.test(t);
+        const pideDatos = campos.length > 0 && (empiezaCampo ||
+            /(dame|dime|cu[aá]l|cu[aá]les|me das|necesito|busca|consulta|pido|quiero|sabes|tienes|ver)/i.test(t));
+
+        if (pideDatos) {
+            const mTerm = t.match(/(?:de|del|para)\s+([^?.!]+?)\s*$/i)
+                || t.match(/(?:tel[eé]fono|celular|rif|c[eé]dula|direcci[oó]n|vendedor|zona|tipo|datos)\s+(?:es\s+)?([A-Za-zÁÉÍÓÚáéíóúñÑ0-9 .,&-]{3,})$/i);
+            if (!mTerm) {
+                await safeSendMessage(from, { text: '👤 Indíqueme el cliente. Ejemplo: *teléfono y rif de daverfren*' });
+                return true;
+            }
+            const term = mTerm[1].replace(/\s+(por favor|gracias)\.?$/i, '').replace(/[?.!]+$/g, '').trim();
             const clientes = await buscarClientesPorNombre(term);
             if (!clientes.length) {
                 await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
                 return true;
             }
-            const campos = mDato[1].toLowerCase();
             let msg = '';
             clientes.slice(0, 3).forEach((c, i) => {
                 if (clientes.length > 1) msg += `${i + 1}. `;
                 msg += `👤 *${c.nombres}*\n`;
-                if (/rif|todo|datos/.test(campos)) msg += `• RIF: *${c.clave || '—'}*\n`;
-                if (/c[eé]dula|cedula|todo|datos/.test(campos)) msg += `• Cédula: ${c.cedula || '—'}\n`;
-                if (/tel[eé]fono|celular|todo|datos/.test(campos)) msg += `• Celular: ${c.celular || '—'}\n• Teléfono: ${c.telefono || '—'}\n`;
-                if (/direcci[oó]n|todo|datos/.test(campos)) msg += `• Dirección: ${c.direccion || '—'}\n`;
-                if (/zona|todo|datos/.test(campos)) msg += `• Zona: ${c.zona || '—'}\n`;
-                if (/vendedor|todo|datos/.test(campos)) msg += `• Vendedor: ${c.vendedor || '—'}\n`;
-                if (/todo|datos/.test(campos)) msg += `• Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
+                if (campos.includes('rif') || campos.includes('todo')) msg += `• RIF: *${formatoRif(c)}*\n`;
+                if (campos.includes('cedula') || campos.includes('todo')) msg += `• Cédula: ${c.cedula || '—'}\n`;
+                if (campos.includes('telefono') || campos.includes('celular') || campos.includes('todo')) {
+                    // El teléfono útil es el celular; si está vacío se usa el fijo.
+                    const telPrincipal = telValido(c.celular) !== '—' ? telValido(c.celular) : telValido(c.telefono);
+                    msg += `• Teléfono: ${telPrincipal}\n`;
+                }
+                if (campos.includes('direccion') || campos.includes('todo')) msg += `• Dirección: ${c.direccion || '—'}\n`;
+                if (campos.includes('zona') || campos.includes('todo')) msg += `• Zona: ${c.zona || '—'}\n`;
+                if (campos.includes('vendedor') || campos.includes('todo')) msg += `• Vendedor: ${c.vendedor || '—'}\n`;
+                if (campos.includes('tipo') || campos.includes('todo')) msg += `• Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
                 msg += `\n`;
             });
             await safeSendMessage(from, { text: msg.trim() });
@@ -2735,10 +2810,7 @@ async function checkNuevasFacturas() {
                 continue;
             }
             const fecha = new Date(f.fecha_reg).toISOString().split('T')[0];
-            let montoNotif = parseFloat(f.total) / (parseFloat(f.porcentaje) || 1);
-            if (f.vendedor_nombre && f.vendedor_nombre.toUpperCase() === 'MANUEL FERRAZ') {
-                montoNotif = montoNotif / 0.80;
-            }
+            const montoNotif = Math.max(0, parseFloat(f.total) - parseFloat(f.abono_factura || 0));
             const msg = `🧾 *NUEVA FACTURA REGISTRADA*\n\nHola *${f.nombres}*, se ha registrado una nueva factura en nuestro sistema:\n\n🔹 *N°:* ${f.nro_factura}\n🔹 *Monto:* $${montoNotif.toFixed(2)}\n🔹 *Fecha:* ${fecha}\n\nPuede consultar su estado de cuenta en:\nhttps://www.one4cars.com/estado_de_cuenta.php/`;
             await safeSendMessage(jid, { text: msg });
             enviados++;
@@ -2809,11 +2881,10 @@ async function checkFacturasVencidas() {
             const nivel = obtenerNivelRecordatorio(dias);
             if (!nivel) continue;
 
-            let monto = (parseFloat(f.total) - parseFloat(f.abono_factura || 0)) / (parseFloat(f.porcentaje) || 1);
-            if (f.vendedor_nombre && f.vendedor_nombre.toUpperCase() === 'MANUEL FERRAZ') {
-                monto = monto / 0.80;
-            }
-            if (monto <= 0) continue;
+            const montoUsd = Math.max(0, parseFloat(f.total) - parseFloat(f.abono_factura || 0));
+            if (montoUsd <= 0) continue;
+            const tasaBcv = parseFloat(dolarInfo.bcv) || 0;
+            const monto = tasaBcv > 1 ? montoUsd * tasaBcv : montoUsd;
 
             const fecha = new Date(f.fecha_reg).toISOString().split('T')[0];
             const yaEnviado = enviados[f.id_factura] && enviados[f.id_factura].includes(nivel);
@@ -2878,12 +2949,8 @@ async function checkVendedoresRecordatorio(force = false) {
             const dias = f.dias_vencida;
             if (dias < 30) continue;
 
-            let monto = (parseFloat(f.total) - parseFloat(f.abono_factura || 0)) / (parseFloat(f.porcentaje) || 1);
+            const monto = Math.max(0, parseFloat(f.total) - parseFloat(f.abono_factura || 0));
             if (monto <= 0 || !f.celular_vendedor) continue;
-
-            if (f.vendedor_nombre && f.vendedor_nombre.toUpperCase() === 'MANUEL FERRAZ') {
-                monto = monto / 0.80;
-            }
 
             const key = f.celular_vendedor.toString().replace(/\D/g, '');
             if (!vendedoresMap[key]) {
@@ -5789,7 +5856,7 @@ const server = http.createServer(async (req, res) => {
         const filtroZona = query.zona || '';
         const filtroVendedor = query.vendedor || '';
         let sql = `SELECT c.id_cliente, c.nombres, c.celular, c.zona, c.vendedor,
-                   SUM((f.total - f.abono_factura) / (f.porcentaje || 1)) as saldo_total,
+                   SUM(f.total - f.abono_factura) as saldo_total,
                    COUNT(f.id_factura) as cantidad_facturas,
                    MAX(DATEDIFF(CURDATE(), f.fecha_reg)) as dias_vencida
                    FROM tab_clientes c JOIN tab_facturas f ON c.id_cliente = f.id_cliente
@@ -6021,6 +6088,19 @@ const server = http.createServer(async (req, res) => {
             }
             const texto = query.texto || '';
             const destino = formatWhatsApp(query.to || '584123715550');
+            if (query.capturar === '1') {
+                const original = safeSendMessage;
+                const capturado = [];
+                safeSendMessage = async (jid, content) => { capturado.push(String((content && content.text) || '')); };
+                let manejado = false;
+                try {
+                    manejado = await atenderConsultaDueno(destino, texto, true);
+                } finally {
+                    safeSendMessage = original;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: true, texto, manejado, respuestas: capturado }, null, 2));
+            }
             const manejado = await atenderConsultaDueno(destino, texto, true);
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: true, texto, manejado }, null, 2));
