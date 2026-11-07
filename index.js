@@ -1251,6 +1251,73 @@ function pareceConsultaAnalitica(raw) {
     return false;
 }
 
+/** Menú de comandos del gerente. */
+function menuGerente() {
+    return `🛠️ *MENÚ DEL GERENTE — ONE4CARS*
+
+📊 *Reportes y consultas (escribe la pregunta tal cual)*
+• “qué cliente debe más”
+• “cuánto vendí hoy”
+• “top 5 productos más vendidos”
+• “cuántas facturas vencidas hay”
+• estado de cuenta de CLIENTE
+• cartera de VENDEDOR
+• tipo de cliente de CLIENTE
+• qué vendedor atiende a CLIENTE
+• teléfono y rif de CLIENTE
+• factura firmada 6331
+• cuánto es 137$ a binance
+• cotización de K20RU11 a binance
+
+🗺️ *Ruta de ventas*
+• a dónde debería vender hoy
+• otra opción
+• ruta LOS TEQUES
+
+📮 *Envíos anti-baneo*
+• cola
+• cola pausa / cola reanudar
+• cola diario 5
+• cola intervalo 30
+• cola horario 8 18
+• cola prueba / cola real
+• cola vaciar
+
+📣 *Campañas*
+• campana fria 60 10
+• campana fria simular 60 5
+• campania leads
+• resumen
+
+🚫 *Cobranza*
+• no cobrar
+• no cobrar 832
+• no cobrar DAVERFREN
+• no cobrar quitar 832
+
+🧠 *Aprendizaje*
+• dudas
+• enseñar 12 => respuesta
+• aprende pregunta => respuesta
+• aprendizaje
+• olvidar 5
+
+🔐 *Licencia y control*
+• licencia
+• licencia activar / licencia desactivar
+• licencia vence 2026-12-31
+
+⚙️ *Panel web*
+https://bot.95-111-228-86.sslip.io
+Usuario: one4cars
+• /entrenar → IA, procesos y ejemplos
+• /recordatorio-estado → cobranza
+• /historial-chat → conversaciones
+• / → QR y estado del bot
+
+_Escribe solo la palabra *comandos* cuando necesites este menú._`;
+}
+
 /** Procesa consultas rápidas del dueño. Devuelve true si ya respondió. */
 async function atenderConsultaDueno(from, rawText, isAdmin) {
     const t = String(rawText || '').trim();
@@ -3678,6 +3745,11 @@ async function startBot() {
                     }
                     return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n💵 Saldo disponible: *$${saldo.saldo.toFixed(2)} USD*\n${saldo.disponible ? '🟢 La IA puede responder.' : '🔴 Saldo agotado: el bot responde en modo clásico.'}` });
                 }
+            }
+
+            // --- 0a00. MENÚ DEL GERENTE (solo la palabra "comandos") ---
+            if (isAdmin && (text === 'comandos' || text === 'comandos admin' || text === 'menu comandos' || text === 'menu gerente')) {
+                return await safeSendMessage(from, { text: menuGerente() });
             }
 
             // --- 0a0. CONSULTAS RÁPIDAS: FACTURA FIRMADA, DATOS DE CLIENTE, BCV ---
@@ -6196,6 +6268,9 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-menu') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, menu: menuGerente() }, null, 2));
     } else if (routename === '/test-ruta') {
         try {
             if (query.otra === '1') {
