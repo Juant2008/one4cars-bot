@@ -5468,7 +5468,7 @@ document.getElementById('sql').addEventListener('keydown',e=>{if(e.ctrlKey&&e.ke
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-<meta http-equiv="refresh" content="30">
+<meta http-equiv="refresh" content="15">
 <title>ONE4CARS Admin</title>
 <style>
 body{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;font-family:'Segoe UI',system-ui,sans-serif}

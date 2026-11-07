@@ -128,7 +128,7 @@
     {
       "id": "aclarar",
       "titulo": "Solicitar aclaración",
-      "tipo": "respuesta",
+      "tipo": "respuesta_libre",
       "descripcion": "Cuando la intención no es clara, hace una pregunta breve para avanzar.",
       "ejemplos": ["no sé", "ayuda", "necesito información"],
       "respuesta": "Con gusto le ayudo. Para orientarle mejor, indíqueme si necesita medios de pago, estado de cuenta, precios, un pedido, consulta de productos o seguimiento de despacho."

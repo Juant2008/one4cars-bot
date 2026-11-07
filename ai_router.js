@@ -25,12 +25,13 @@ let fallosSeguidos = 0;
 let pausaHasta = 0;
 
 function leerKey() {
-    const env = (process.env.DEEPSEEK_API_KEY || '').trim();
-    if (env) return env;
     try {
-        if (fs.existsSync(KEY_FILE)) return fs.readFileSync(KEY_FILE, 'utf8').trim();
+        if (fs.existsSync(KEY_FILE)) {
+            const k = fs.readFileSync(KEY_FILE, 'utf8').trim();
+            if (k) return k;
+        }
     } catch (e) {}
-    return '';
+    return (process.env.DEEPSEEK_API_KEY || '').trim();
 }
 
 function cargarCatalogo() {

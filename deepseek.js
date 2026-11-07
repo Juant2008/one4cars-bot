@@ -8,12 +8,13 @@ const path = require('path');
 const KEY_FILE = path.join(__dirname, 'deepseek_key.txt');
 
 function leerKey() {
-    const env = (process.env.DEEPSEEK_API_KEY || '').trim();
-    if (env) return env;
     try {
-        if (fs.existsSync(KEY_FILE)) return fs.readFileSync(KEY_FILE, 'utf8').trim();
+        if (fs.existsSync(KEY_FILE)) {
+            const k = fs.readFileSync(KEY_FILE, 'utf8').trim();
+            if (k) return k;
+        }
     } catch (e) {}
-    return '';
+    return (process.env.DEEPSEEK_API_KEY || '').trim();
 }
 
 let API_KEY = leerKey();
