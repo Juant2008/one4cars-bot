@@ -238,6 +238,7 @@ const aiRouter = require('./ai_router');
 const catalogoTecnico = require('./catalogo_tecnico');
 const reportesIA = require('./reportes_ia');
 const licencia = require('./licencia');
+const campanias = require('./campanias');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
@@ -262,6 +263,10 @@ const pool = mysql.createPool({
 catalogoTecnico.init(pool);
 reportesIA.init(pool);
 licencia.init(pool);
+campanias.init(pool, {
+    enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
+    format: formatWhatsApp
+});
 const poolLocal = mysql.createPool({
     host: process.env.LOCAL_DB_HOST || '127.0.0.1',
     user: process.env.LOCAL_DB_USER || process.env.DB_USER || 'juant200_one4car',
@@ -1500,6 +1505,15 @@ async function initDB() {
             actualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
         try { await pool.execute("INSERT IGNORE INTO bot_licencia (id, estado, fecha_expiracion) VALUES (1, 'activa', '2099-12-31')"); } catch (e) {}
+
+        await pool.execute(`CREATE TABLE IF NOT EXISTS bot_campania_log (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            campania VARCHAR(40) NOT NULL,
+            telefono VARCHAR(100) NOT NULL,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_campania (campania, telefono),
+            INDEX idx_fecha (fecha)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci`);
         
         await pool.execute(`CREATE TABLE IF NOT EXISTS historial_chat (
             id INT AUTO_INCREMENT PRIMARY KEY, 
@@ -3186,7 +3200,50 @@ async function startBot() {
                 }
             }
 
-            // --- 0a2. REPORTES IA EN LENGUAJE NATURAL (ADMIN) ---
+            // --- 0a2. CAMPAÑAS DE RECUPERACIÓN (ADMIN) ---
+            if (isAdmin && (text.startsWith('campana ') || text === 'campana' || text === 'resumen' || text.startsWith('campania '))) {
+                try {
+                    if (text === 'resumen') {
+                        await safeSendMessage(from, { text: '📊 Consultando los datos del día...' });
+                        return await safeSendMessage(from, { text: await campanias.resumenDiario() });
+                    }
+                    const partes = rawText.trim().split(/\s+/);
+                    const tipo = (partes[1] || '').toLowerCase();
+                    const soloSimular = partes.some(p => /simular|previsualizar|preview/i.test(p));
+                    const nums = partes.slice(2).map(p => parseInt(p, 10)).filter(n => !isNaN(n));
+                    if (tipo === 'fria' || tipo === 'frios' || tipo === 'reactivar') {
+                        const dias = nums[0] || 60;
+                        const limite = Math.min(nums[1] || 10, 50);
+                        await safeSendMessage(from, { text: `🔎 Buscando clientes sin compra desde hace ${dias} días...` });
+                        const r = await campanias.enviarFria({ dias, limite, soloSimular });
+                        let msg = `${soloSimular ? '👀 *SIMULACIÓN DE CAMPAÑA FRÍA*' : '🚀 *CAMPAÑA FRÍA ENVIADA*'}\n\n`;
+                        msg += `• Clientes fríos encontrados: *${r.totalFrios}*\n`;
+                        msg += `• ${soloSimular ? 'A enviar' : 'Mensajes enviados'}: *${soloSimular ? r.mensajes.length : r.enviados}*\n`;
+                        msg += `• Omitidos (ya contactados en 45 días): *${r.omitidosPorDuplicado}*\n`;
+                        if (soloSimular && r.mensajes.length) {
+                            msg += `\n*Primer mensaje:*\n${r.mensajes[0].texto.slice(0, 400)}`;
+                        }
+                        return await safeSendMessage(from, { text: msg });
+                    }
+                    if (tipo === 'leads' || tipo === 'interesados') {
+                        const horas = nums[0] || 24;
+                        const limite = Math.min(nums[1] || 20, 50);
+                        await safeSendMessage(from, { text: `🔎 Buscando interesados sin registro desde hace ${horas} horas...` });
+                        const r = await campanias.enviarLeads({ horas, limite, soloSimular });
+                        let msg = `${soloSimular ? '👀 *SIMULACIÓN DE SEGUIMIENTO DE LEADS*' : '🚀 *SEGUIMIENTO DE LEADS ENVIADO*'}\n\n`;
+                        msg += `• Interesados encontrados: *${r.encontrados}*\n`;
+                        msg += `• ${soloSimular ? 'A enviar' : 'Mensajes enviados'}: *${soloSimular ? r.mensajes.length : r.enviados}*\n`;
+                        if (soloSimular && r.mensajes.length) msg += `\n*Primer mensaje:*\n${r.mensajes[0].texto.slice(0, 400)}`;
+                        return await safeSendMessage(from, { text: msg });
+                    }
+                    return await safeSendMessage(from, { text: 'Uso:\n• *campana fria 60 10* (días sin comprar, límite)\n• *campana fria simular 60 5*\n• *campania leads 24 10*\n• *resumen*' });
+                } catch (e) {
+                    console.log('[CAMPANA] Error:', e.message);
+                    return await safeSendMessage(from, { text: `❌ Error de campaña: ${e.message}` });
+                }
+            }
+
+            // --- 0a3. REPORTES IA EN LENGUAJE NATURAL (ADMIN) ---
             if (isAdmin && (text.startsWith('reporte ') || text.startsWith('pregunta '))) {
                 const pregunta = rawText.replace(/^(reporte|pregunta)\s+/i, '').trim();
                 if (pregunta) {
@@ -5518,6 +5575,32 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ error: e.message }, null, 2));
         }
+    } else if (routename === '/test-resumen') {
+        try {
+            const respuesta = await campanias.resumenDiario();
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ respuesta }, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-campania') {
+        try {
+            const tipo = (query.tipo || 'fria').toLowerCase();
+            const dias = parseInt(query.dias, 10) || 60;
+            const limite = Math.min(parseInt(query.limite, 10) || 5, 20);
+            let r;
+            if (tipo === 'leads') {
+                r = await campanias.enviarLeads({ horas: dias, limite, soloSimular: true });
+            } else {
+                r = await campanias.enviarFria({ dias, limite, soloSimular: true });
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(r, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }, null, 2));
+        }
     } else if (routename === '/test-reencuentro') {
         try {
             const from = query.from || 'test-reencuentro@s.whatsapp.net';
@@ -6295,4 +6378,22 @@ server.listen(PORT, process.env.BIND_HOST || '0.0.0.0', async () => {
     startBot();
     actualizarDolar();
     setInterval(actualizarDolar, 3600000);
+
+    // Resumen diario automático a los administradores (18:00 Caracas).
+    let resumenEnviadoHoy = '';
+    setInterval(async () => {
+        try {
+            const ahora = new Date().toLocaleString('es-VE', { timeZone: 'America/Caracas', hour12: false, hour: '2-digit', minute: '2-digit' });
+            const fechaHoy = new Date().toLocaleDateString('es-VE', { timeZone: 'America/Caracas' });
+            const [hh, mm] = ahora.split(':').map(Number);
+            if (hh === 18 && mm < 15 && resumenEnviadoHoy !== fechaHoy && isBotReady()) {
+                resumenEnviadoHoy = fechaHoy;
+                const texto = await campanias.resumenDiario();
+                for (const id of ADMIN_IDS) {
+                    try { await safeSendMessage(formatWhatsApp(id), { text: texto }); } catch (e) {}
+                }
+                console.log('[RESUMEN] Diario enviado a administradores.');
+            }
+        } catch (e) { console.log('[RESUMEN] Error:', e.message); }
+    }, 60000);
 });
