@@ -1218,6 +1218,53 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
     }
 
+    // 2b) Cotización de un producto (en $ y Bs según la tasa pedida)
+    const mCot = t.match(/cotizaci[oó]n\s+(?:de|del|para)\s+(.+)/i);
+    if (mCot) {
+        let term = mCot[1].trim().replace(/[?.!]+$/g, '');
+        const esBin = /binance|p2p/i.test(term);
+        const esPar = /paralelo/i.test(term);
+        term = term
+            .replace(/\s*(?:a|en|por)\s+(?:binance|p2p|bcv|paralelo).*$/i, '')
+            .replace(/\s*(?:en|por)\s+(?:bol[ií]vares|bs\.?).*$/i, '')
+            .trim();
+        if (term) {
+            if (/factura|cliente|saldo|estado de cuenta/i.test(term)) return false;
+            let prods = null;
+            const codigo = term.replace(/[^A-Za-z0-9-]/g, '');
+            if (codigo && /\d/.test(codigo) && codigo.length >= 3) {
+                try { prods = await buscarProductoPorCodigo(codigo); } catch (e) {}
+            }
+            if (!prods || !prods.length) {
+                try { prods = await buscarProductoPorTexto(term); } catch (e) {}
+            }
+            if (!prods || !prods.length) {
+                await safeSendMessage(from, { text: `🔎 No encontré el producto "*${term}*". Verifique el código o el nombre.` });
+                return true;
+            }
+            if (typeof actualizarDolar === 'function' && (!dolarInfo.bcv || parseFloat(dolarInfo.bcv) <= 1)) {
+                try { await actualizarDolar(); } catch (e) {}
+            }
+            const pct = await obtenerPorcentaje();
+            const nombreTasa = esBin ? 'BINANCE P2P' : (esPar ? 'PARALELO' : 'BCV');
+            const tasa = esBin ? (parseFloat(dolarInfo.binance) || 0)
+                : (esPar ? (parseFloat(dolarInfo.paralelo) || 0) : (parseFloat(dolarInfo.bcv) || 0));
+            let msg = `🧾 *COTIZACIÓN — ${nombreTasa}*\n\n`;
+            prods.slice(0, 5).forEach((p, i) => {
+                const usd = parseFloat(p.precio_minimo || 0) / (pct || 1);
+                const bs = usd * tasa;
+                const stock = parseFloat(p.stock_total || 0);
+                msg += `*${i + 1}.* *${p.producto}*\n`;
+                msg += `   ${String(p.descripcion || '').slice(0, 90)}\n`;
+                msg += `   💵 *$${formatoBs(usd)}* · *Bs. ${formatoBs(bs)}*`;
+                msg += stock > 0 ? ` · ✅ ${stock} und\n\n` : ` · ⏳ a confirmar\n\n`;
+            });
+            msg += `_Tasa ${nombreTasa}: ${formatoBs(tasa)} Bs./USD._\n_Precios al mayor. Compra mínima USD 100._`;
+            await safeSendMessage(from, { text: msg.trim() });
+            return true;
+        }
+    }
+
     // 3) Cotizaciones y conversiones (BCV / Binance P2P / paralelo)
     const mencionaBinance = /binance|p2p/i.test(tl);
     const mencionaParalelo = /paralelo|monitor/i.test(tl);
