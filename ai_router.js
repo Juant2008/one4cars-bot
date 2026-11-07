@@ -230,6 +230,9 @@ function aplicarGuardas(mensaje, decision) {
     const t = normalizarTexto(mensaje);
     const d = { ...decision, parametros: { ...(decision.parametros || {}) } };
     if (d.accion === 'responder') {
+        if (/\b(interesado|interesada|me interesa|me interesan|comprar al mayor|compra al mayor|mayorista|distribuidor|soy (una )?tienda|tengo (un )?negocio|tengo (un )?local|comprar al por mayor)\b/.test(t)) {
+            return { ...d, accion: 'registro_mayorista', confianza: Math.max(d.confianza, 0.8) };
+        }
         if (/\b(hablar con|asesor|operador|humano|reclamo|queja|no me responde|urgencia)\b/.test(t)) {
             return { ...d, accion: 'asesor', confianza: Math.max(d.confianza, 0.72) };
         }
