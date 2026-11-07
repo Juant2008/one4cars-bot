@@ -251,7 +251,7 @@ const BOT_VERSION = '2026-11-07.1-rodi-ai'; // Visible en /ping para confirmar q
 const PDF_URL_CATALOGO = process.env.PDF_URL_CATALOGO || 'https://www.one4cars.com/catalogo.pdf';
 
 // LISTA DE ADMINISTRADORES
-const ADMIN_IDS = ["228621243408492", "97899534934200"];   
+const ADMIN_IDS = ["228621243408492", "97899534934200", "584123715550"];   
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'one4cars.com',
     user: process.env.DB_USER || 'juant200_one4car',
@@ -1103,6 +1103,153 @@ async function buscarClientePorTelefono(tel) {
         );
         return r[0] || null;
     } catch (e) { return null; }
+}
+
+// ===== CONSULTAS RÁPIDAS (DUEÑO / ADMIN) =====
+async function buscarFacturaPorNumero(nro) {
+    try {
+        const [r] = await pool.execute(
+            `SELECT f.*, v.nombre AS nombre_vendedor
+             FROM tab_facturas f
+             LEFT JOIN tab_vendedores v ON v.id_vendedor = f.id_vendedor
+             WHERE f.nro_factura = ?
+             ORDER BY f.id_factura DESC LIMIT 1`,
+            [Number(nro)]
+        );
+        return r[0] || null;
+    } catch (e) { return null; }
+}
+
+async function buscarClientesPorNombre(term) {
+    try {
+        const t = String(term || '').trim();
+        const [r] = await pool.execute(
+            `SELECT id_cliente, nombres, cedula, clave, celular, telefono, direccion, zona, vendedor, tipo, activo, cliente_oficina
+             FROM tab_clientes
+             WHERE nombres LIKE ? OR clave LIKE ? OR cedula LIKE ?
+             ORDER BY nombres LIMIT 5`,
+            [`%${t}%`, `%${t}%`, `%${t}%`]
+        );
+        return r || [];
+    } catch (e) { return []; }
+}
+
+function parseMonto(txt) {
+    let s = String(txt || '').replace(/[^\d.,]/g, '');
+    if (!s) return NaN;
+    const lastComma = s.lastIndexOf(',');
+    const lastDot = s.lastIndexOf('.');
+    if (lastComma > -1 && lastDot > -1) {
+        if (lastComma > lastDot) s = s.replace(/\./g, '').replace(',', '.');
+        else s = s.replace(/,/g, '');
+    } else if (lastComma > -1) {
+        const dec = s.length - lastComma - 1;
+        s = dec === 3 ? s.replace(/,/g, '') : s.replace(',', '.');
+    } else if (lastDot > -1) {
+        const dec = s.length - lastDot - 1;
+        if (dec === 3 && /^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+    }
+    const n = parseFloat(s);
+    return isNaN(n) ? NaN : n;
+}
+
+function formatoBs(n) {
+    return Number(n || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function linkReporteFactura(f) {
+    const fReg = new Date(f.fecha_reg).toISOString().split('T')[0];
+    const params = `id_factura=${f.id_factura}&nro_factura=${f.nro_factura}&fecha_reg=${fReg}&total=${f.total}&abono_factura=${f.abono_factura}&nombres=${encodeURIComponent((f.nombres || '').trim())}&nombre=${encodeURIComponent((f.nombre_vendedor || '').trim())}&direccion=${encodeURIComponent((f.direccion || '').trim())}&cedula=${(f.cedula || '').trim()}&celular=${encodeURIComponent((f.celular || '').trim())}&telefono=${encodeURIComponent((f.telefono || '').trim())}&id_cliente=${f.id_cliente}&zona=${encodeURIComponent((f.zona || '').trim())}&descuento=${f.descuento}&total_desc=${f.total_desc}`;
+    return `https://one4cars.com/sevencorp/factura_full_reporte_web.php?${params}`;
+}
+
+/** Procesa consultas rápidas del dueño. Devuelve true si ya respondió. */
+async function atenderConsultaDueno(from, rawText, isAdmin) {
+    const t = String(rawText || '').trim();
+    if (!t) return false;
+    const tl = t.toLowerCase();
+
+    // 1) Factura firmada / link de factura
+    if (/factura/i.test(tl) && /(firmada|firmado|pdf|link|imagen|reporte)/i.test(tl)) {
+        if (!isAdmin) return false;
+        const m = t.match(/(?:n[°ºo]?\.?\s*|#\s*)?(\d{2,6})\b/);
+        if (!m) {
+            await safeSendMessage(from, { text: '🧾 Indíqueme el número de factura. Ejemplo: *factura firmada 6331*' });
+            return true;
+        }
+        const f = await buscarFacturaPorNumero(parseInt(m[1], 10));
+        if (!f) {
+            await safeSendMessage(from, { text: `❌ No encontré la factura *${m[1]}*. Verifique el número.` });
+            return true;
+        }
+        const monto = (parseFloat(f.total) - parseFloat(f.abono_factura || 0)) / (parseFloat(f.porcentaje) || 1);
+        const fReg = new Date(f.fecha_reg).toISOString().split('T')[0];
+        const firmada = `https://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg`;
+        await safeSendMessage(from, { text: `🧾 *FACTURA #${f.nro_factura}*\n\n👤 Cliente: *${f.nombres}*\n📅 Fecha: ${fReg}\n💰 Saldo: *$${monto.toFixed(2)}*\n📌 Estado: ${String(f.pagada || '').toUpperCase() === 'SI' ? 'Pagada' : 'Pendiente'}${String(f.anulado || '').toLowerCase() === 'si' ? ' · ANULADA' : ''}\n\n✍️ *Factura firmada:*\n${firmada}\n\n📄 *Reporte completo:*\n${linkReporteFactura(f)}` });
+        return true;
+    }
+
+    // 2) Datos de cliente por nombre / RIF / cédula
+    if (isAdmin) {
+        const mDato = t.match(/(tel[eé]fono|celular|rif|c[eé]dula|cedula|direcci[oó]n|vendedor|zona|datos|todo)\s*(?:de|del|para)\s+(.+)/i);
+        if (mDato) {
+            const term = mDato[2].replace(/[?.!]+$/g, '').trim();
+            const clientes = await buscarClientesPorNombre(term);
+            if (!clientes.length) {
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                return true;
+            }
+            const campos = mDato[1].toLowerCase();
+            let msg = '';
+            clientes.slice(0, 3).forEach((c, i) => {
+                if (clientes.length > 1) msg += `${i + 1}. `;
+                msg += `👤 *${c.nombres}*\n`;
+                if (/rif|todo|datos/.test(campos)) msg += `• RIF: *${c.clave || '—'}*\n`;
+                if (/c[eé]dula|cedula|todo|datos/.test(campos)) msg += `• Cédula: ${c.cedula || '—'}\n`;
+                if (/tel[eé]fono|celular|todo|datos/.test(campos)) msg += `• Celular: ${c.celular || '—'}\n• Teléfono: ${c.telefono || '—'}\n`;
+                if (/direcci[oó]n|todo|datos/.test(campos)) msg += `• Dirección: ${c.direccion || '—'}\n`;
+                if (/zona|todo|datos/.test(campos)) msg += `• Zona: ${c.zona || '—'}\n`;
+                if (/vendedor|todo|datos/.test(campos)) msg += `• Vendedor: ${c.vendedor || '—'}\n`;
+                if (/todo|datos/.test(campos)) msg += `• Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
+                msg += `\n`;
+            });
+            await safeSendMessage(from, { text: msg.trim() });
+            return true;
+        }
+    }
+
+    // 3) Conversión de montos a BCV
+    const mencionaBcv = /(bcv|bol[ií]vares|bs\.?|tasa)/i.test(tl);
+    if (mencionaBcv) {
+        const numMatch = t.match(/([0-9][0-9.,]*)/);
+        try {
+            if (!numMatch || !numMatch[1]) {
+                await safeSendMessage(from, { text: '💵 Indíqueme el monto. Ejemplo: *cuánto es 102.30$ a BCV*' });
+                return true;
+            }
+            if ((!dolarInfo.bcv || parseFloat(dolarInfo.bcv) <= 1) && typeof actualizarDolar === 'function') {
+                try { await actualizarDolar(); } catch (e) {}
+            }
+            const tasa = parseFloat(dolarInfo.bcv) || 0;
+            if (tasa <= 1) {
+                await safeSendMessage(from, { text: '⚠️ No pude obtener la tasa BCV en este momento. Intente de nuevo en unos minutos.' });
+                return true;
+            }
+            const monto = parseMonto(numMatch[1]);
+            if (isNaN(monto)) { await safeSendMessage(from, { text: '❌ No entendí el monto.' }); return true; }
+            const esBolivares = /(bs\.?|bol[ií]vares)/i.test(tl) && !/(\$|usd|d[oó]lares?)/i.test(tl);
+            if (esBolivares) {
+                await safeSendMessage(from, { text: `💵 *CONVERSIÓN A USD*\n\n*Bs. ${formatoBs(monto)}* ÷ *${formatoBs(tasa)} Bs./USD* = *$${formatoBs(monto / tasa)}*\n\n_Tasa BCV del día._` });
+            } else {
+                await safeSendMessage(from, { text: `💵 *CONVERSIÓN A BCV*\n\n*$${formatoBs(monto)}* × *${formatoBs(tasa)} Bs./USD* = *Bs. ${formatoBs(monto * tasa)}*\n\n_Tasa BCV del día._` });
+            }
+            return true;
+        } catch (e) {
+            console.log('[CONSULTA] Error conversión:', e.message);
+            return false;
+        }
+    }
+    return false;
 }
 
 // ===== CLIENTES MAYORISTAS: REGISTRO Y CONTROL =====
@@ -3022,7 +3169,7 @@ async function startBot() {
                 }
             }
 
-            const isAdmin = ADMIN_IDS.some(id => from.includes(id));
+            const isAdmin = ADMIN_IDS.some(id => from.includes(id) || String((msg.key && (msg.key.senderPn || msg.key.remoteJidAlt)) || '').includes(id));
             const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
 
             if (!licencia.estaActiva() && !isAdmin) {
@@ -3208,6 +3355,9 @@ async function startBot() {
                     return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n💵 Saldo disponible: *$${saldo.saldo.toFixed(2)} USD*\n${saldo.disponible ? '🟢 La IA puede responder.' : '🔴 Saldo agotado: el bot responde en modo clásico.'}` });
                 }
             }
+
+            // --- 0a0. CONSULTAS RÁPIDAS: FACTURA FIRMADA, DATOS DE CLIENTE, BCV ---
+            if (await atenderConsultaDueno(from, rawText, isAdmin)) return;
 
             // --- 0a1. LICENCIA / CONTROL (ADMIN) ---
             if (isAdmin && (text === 'licencia' || text.startsWith('licencia '))) {
@@ -5640,6 +5790,21 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-consulta') {
+        try {
+            if (!isBotReady()) {
+                res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'bot no conectado' }));
+            }
+            const texto = query.texto || '';
+            const destino = formatWhatsApp(query.to || '584123715550');
+            const manejado = await atenderConsultaDueno(destino, texto, true);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, texto, manejado }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
     } else if (routename === '/test-no-cobrar') {
         try {
             const { fijos, manuales } = await automatizaciones.listarNoCobrar();
