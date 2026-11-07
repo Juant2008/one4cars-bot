@@ -233,10 +233,11 @@ const cobranza = require('./cobranza');
 const marketingModulo = require('./marketing');
 const notificador = require('./notificador_local');
 const ia = require('./deepseek');
+const aiRouter = require('./ai_router');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
-const BOT_VERSION = '2026-10-13.4-ocr'; // Visible en /ping para confirmar qué versión está desplegada
+const BOT_VERSION = '2026-11-07.1-rodi-ai'; // Visible en /ping para confirmar qué versión está desplegada
 const PDF_URL_CATALOGO = process.env.PDF_URL_CATALOGO || 'https://www.one4cars.com/catalogo.pdf';
 
 // LISTA DE ADMINISTRADORES
@@ -252,10 +253,10 @@ const pool = mysql.createPool({
     charset: 'UTF8_SPANISH_CI'
 });
 const poolLocal = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    password: '',
-    database: 'venezon',
+    host: process.env.LOCAL_DB_HOST || '127.0.0.1',
+    user: process.env.LOCAL_DB_USER || process.env.DB_USER || 'juant200_one4car',
+    password: process.env.LOCAL_DB_PASSWORD || process.env.DB_PASSWORD || '',
+    database: process.env.LOCAL_DB_NAME || process.env.DB_NAME || 'juant200_venezon',
     waitForConnections: true,
     connectionLimit: 5,
     queueLimit: 0,
@@ -271,7 +272,7 @@ let localDBAvailable = false;
         console.log("[DB] ✅ BD Local disponible.");
     } catch (e) {
         localDBAvailable = false;
-        console.log("[DB] ⚠️ BD Local no disponible (normal en Render).");
+        console.log("[DB] ⚠️ BD Local no disponible.");
     }
 })();
 const dualExecute = async (sql, params) => {
@@ -1888,6 +1889,163 @@ async function procesarRIFConsulta(from, rawText, text) {
     return null;
 }
 
+// ===== ENRUTADOR IA: ACCIONES PERMITIDAS =====
+// La IA entiende lenguaje natural, pero solo puede ejecutar las acciones del
+// catálogo comandos.json. Los enlaces, precios y stock salen del catálogo o
+// de la base de datos; nunca los inventa el modelo.
+function accionCatalogo(id) {
+    try {
+        const cat = aiRouter.cargarCatalogo();
+        return (cat.acciones || []).find(a => a.id === id) || null;
+    } catch (e) { return null; }
+}
+
+async function responderRouter(from, texto) {
+    const limpio = String(texto || '').trim();
+    if (!limpio) return false;
+    await safeSendMessage(from, { text: limpio });
+    try { await guardarMensaje(from, 'model', limpio); } catch (e) {}
+    return true;
+}
+
+function esComandoAdministrativo(texto) {
+    return texto === 'ia' || texto.startsWith('ia ') ||
+        texto === 'saldo' || texto === 'saldo ia' || texto === 'estado ia' ||
+        texto.startsWith('nota ') || texto === 'top10' || texto === 'top 10' ||
+        texto === 'mas vendidos' || texto === 'top' ||
+        texto === 'dolar' || texto === 'bcv' || texto === 'paralelo' || texto === 'binance' ||
+        texto.startsWith('!');
+}
+
+function parecePedidoOperativo(rawText) {
+    try {
+        if (typeof parseMultiItemMessage === 'function' && parseMultiItemMessage(rawText)) return true;
+    } catch (e) {}
+    if (detectarTransferencia(rawText)) return true;
+    if (/(?:^|\s)\d{1,4}\s*(?:x|por|unidades?|und\.?)\s*[A-Za-z0-9-]{3,}/i.test(rawText)) return true;
+    if (/(?:^|\s)\d{1,4}\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]{4,}/.test(rawText)) return true;
+    if (/[A-Za-z]{2,}\d{2,}/.test(rawText) && /\b\d{1,4}\b/.test(rawText)) return true;
+    if (/\b(ya\s+pagu[eé]|pagu[eé]|envi[eé]\s+el\s+pago|adjunto\s+pago|comprobante|referencia|transferencia|pago\s+m[oó]vil|dep[oó]sito)\b/i.test(rawText)) return true;
+    return false;
+}
+
+async function responderProductosIA(from, busqueda) {
+    const consulta = String(busqueda || '').trim();
+    if (!consulta) {
+        return await responderRouter(from, '🔎 Indíqueme la pieza que busca y, si aplica, marca, modelo y año del vehículo. Así puedo confirmar precio y disponibilidad.');
+    }
+    let prods = null;
+    const posibleCodigo = consulta.replace(/[^A-Za-z0-9-]/g, '');
+    if (posibleCodigo.length >= 4 && /\d/.test(posibleCodigo) && /[A-Za-z]/.test(posibleCodigo)) {
+        try { prods = await buscarProductoPorCodigo(posibleCodigo); } catch (e) {}
+    }
+    if (!prods || !prods.length) {
+        try { prods = await buscarProductoPorTexto(consulta); } catch (e) {}
+    }
+    if (!prods || !prods.length) {
+        return await responderRouter(from, `No encontré una coincidencia exacta para "*${consulta.slice(0, 80)}*" en el inventario.\n\nPara confirmar precio y disponibilidad, indíqueme:\n• Pieza\n• Marca, modelo y año del vehículo\n• Cantidad\n\nTambién puede consultar el catálogo: https://www.one4cars.com/consulta_productos.php/`);
+    }
+    const pct = await obtenerPorcentaje();
+    if (prods.length > 1) {
+        let msg = `🔎 *Resultados para "${consulta.slice(0, 80)}"*\n\n`;
+        prods.slice(0, 8).forEach((p, i) => {
+            const precio = parseFloat(p.precio_minimo || 0) / pct;
+            const desc = String(p.descripcion || '');
+            msg += `*${i + 1}.* ${p.producto} — *$${precio.toFixed(2)}*\n   ${desc.slice(0, 70)}${desc.length > 70 ? '...' : ''}\n`;
+        });
+        msg += `\nResponda el *número* del producto que necesita.`;
+        pendingProductSelection.set(from, { productos: prods.slice(0, 8), pct });
+        return await responderRouter(from, msg);
+    }
+    const p = prods[0];
+    const precio = parseFloat(p.precio_minimo || 0) / pct;
+    let stock = '';
+    if (parseFloat(p.stock_total || 0) <= 0) {
+        const fab = parseFloat(p.cantidad_fabricando || 0);
+        stock = fab > 0 ? '\n🚚 *Sin existencia, en tránsito desde fábrica*' : '\n⏳ *Disponibilidad bajo confirmación*';
+    } else {
+        stock = '\n✅ *Disponible*';
+    }
+    const caption = `📦 *${p.producto}*\n💰 *Precio: $${precio.toFixed(2)}* (pagadero a tasa BCV)${stock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`;
+    try {
+        if (!isBotReady()) throw new Error('socket no listo');
+        registrarEnvioBot(from, caption);
+        await socketBot.sendMessage(from, { image: { url: `https://one4cars.com/imagen/${p.producto}.jpg` }, caption });
+    } catch (e) {
+        await safeSendMessage(from, { text: caption });
+    }
+    try { await guardarMensaje(from, 'model', caption); } catch (e) {}
+    return true;
+}
+
+async function enviarReporteVisitasHoy(from) {
+    const hoyStr = new Date().toISOString().split('T')[0];
+    try {
+        const [vis] = await pool.execute("SELECT a.id_agenda, a.hora, c.nombres, c.celular, c.zona, c.direccion FROM tab_agenda_visitas a JOIN tab_clientes c ON a.id_cliente = c.id_cliente WHERE a.fecha = ? AND (a.estado IN ('pendiente','no_contesto','ausente','pospuso') OR a.estado IS NULL) ORDER BY c.zona, c.nombres", [hoyStr]);
+        if (vis.length === 0) return await responderRouter(from, `📅 *Visitas de hoy (${hoyStr})*\n\nNo hay visitas pendientes para hoy.`);
+        const zonas = [...new Set(vis.map(v => v.zona))];
+        let reporte = `📅 *Visitas de hoy (${hoyStr})*\nTotal: *${vis.length}* | Zonas: *${zonas.length}*\n\n`;
+        let zonaAct = '';
+        vis.forEach((v, i) => {
+            if (v.zona !== zonaAct) { zonaAct = v.zona; reporte += `\n📍 *${zonaAct || 'Sin zona'}*\n`; }
+            reporte += `  ${i + 1}. ${v.nombres} ${v.hora ? '🕐 ' + v.hora.substring(0, 5) : ''}\n     📞 ${v.celular || '—'}\n`;
+        });
+        reporte += `\n🔗 ${process.env.BASE_URL || 'https://bot.95-111-228-86.sslip.io'}/visitas?fecha=${hoyStr}`;
+        return await responderRouter(from, reporte);
+    } catch (e) {
+        console.log('[VISITAS HOY] Error:', e.message);
+        return await responderRouter(from, 'No pude obtener el reporte de visitas en este momento. Un administrador puede revisarlo en el panel.');
+    }
+}
+
+async function ejecutarAccionRouter(decision, ctx) {
+    const accion = accionCatalogo(decision.accion);
+    if (!accion) return false;
+    const from = ctx.from;
+    const texto = String(decision.respuesta || '').trim();
+    switch (accion.tipo) {
+        case 'respuesta':
+            return await responderRouter(from, accion.respuesta || texto);
+        case 'respuesta_libre':
+            return await responderRouter(from, texto || accion.respuesta || '');
+        case 'estado_cuenta': {
+            const rif = String((decision.parametros && decision.parametros.rif) || '').trim();
+            if (rif) {
+                pendienteFactura.set(from, { paso: 'rif' });
+                const manejado = await procesarRIFConsulta(from, rif, normalizar(rif));
+                if (manejado) return true;
+            }
+            pendienteFactura.set(from, { paso: 'rif' });
+            return await responderRouter(from, texto || accion.respuesta || '');
+        }
+        case 'producto':
+            return await responderProductosIA(from, (decision.parametros && decision.parametros.busqueda) || ctx.rawText);
+        case 'pedido':
+            return await responderRouter(from, accion.respuesta || texto || '');
+        case 'asesor': {
+            await responderRouter(from, accion.respuesta || texto || '');
+            try {
+                const adminJids = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
+                for (const aj of adminJids) {
+                    await safeSendMessage(aj, { text: `👤 *SOLICITUD DE ASESOR HUMANO*\nCliente: ${ctx.pushName || 'No identificado'}\nTeléfono: ${from.split('@')[0]}\nMensaje: ${String(ctx.rawText || '').slice(0, 300)}` });
+                }
+            } catch (e) {}
+            return true;
+        }
+        case 'visitas':
+            if (!ctx.esAdmin) {
+                return await responderRouter(from, '📅 El reporte de visitas está disponible para administradores. Si necesita asistencia personalizada, escriba *9* y un especialista le atenderá.');
+            }
+            return await enviarReporteVisitasHoy(from);
+        case 'dolar':
+            await actualizarDolar();
+            return await responderRouter(from, `💵 *TASAS DEL DÍA*\n\nBCV: *${dolarInfo.bcv} Bs./USD*\nParalelo: *${dolarInfo.paralelo} Bs./USD*\nBinance P2P: *${dolarInfo.binance} Bs./USD*\n\n_Tasas informativas, sujetas a variación._`);
+        default:
+            if (texto) return await responderRouter(from, texto);
+            return false;
+    }
+}
+
 async function actualizarDolar() {
     if (!proceActivo('dolar')) return;
     try {
@@ -2376,6 +2534,8 @@ async function cargarConfigBD() {
                 try { procesosEstado = JSON.parse(r.valor); } catch (e) {}
             } else if ((r.clave === 'instrucciones' || r.clave === 'instrucciones.txt') && r.valor) {
                 ia.guardarInstrucciones(r.valor, false);
+            } else if (r.clave === 'comandos' && r.valor) {
+                try { aiRouter.guardarCatalogo(r.valor); } catch (e) { console.log('[CONFIG] comandos.json inválido en BD:', e.message); }
             }
         }
         for (const p of PROCESOS_DISPO) {
@@ -2406,6 +2566,15 @@ async function guardarInstruccionesBD(texto) {
             [texto, texto]
         );
     } catch (e) { console.log("[CONFIG] Error guardando instrucciones en BD:", e.message); }
+}
+
+async function guardarComandosBD(texto) {
+    try {
+        await pool.execute(
+            "INSERT INTO bot_config (clave, valor) VALUES ('comandos', ?) ON DUPLICATE KEY UPDATE valor = ?",
+            [texto, texto]
+        );
+    } catch (e) { console.log("[CONFIG] Error guardando comandos en BD:", e.message); }
 }
 
 // ===== BOT WHATSAPP =====
@@ -2712,7 +2881,7 @@ async function startBot() {
                 if (text === 'saldo' || text === 'saldo ia' || text === 'saldo deeepseek' || text === 'ia saldo') {
                     const saldo = await ia.verificarSaldo();
                     if (saldo === null) {
-                        return await safeSendMessage(from, { text: `🤖 IA DeepSeek: ${ia.estaHabilitada() ? '🟢 Activa' : '🔴 Desactivada'}.\n\nNo pude consultar el saldo. Verifique que DEEPSEEK_API_KEY esté configurada en Render.` });
+                        return await safeSendMessage(from, { text: `🤖 IA DeepSeek: ${ia.estaHabilitada() ? '🟢 Activa' : '🔴 Desactivada'}.\n\nNo pude consultar el saldo. Verifique que DEEPSEEK_API_KEY esté configurada en el servidor.` });
                     }
                     return await safeSendMessage(from, { text: `🤖 *Estado de la IA DeepSeek*\n\n💵 Saldo disponible: *$${saldo.saldo.toFixed(2)} USD*\n${saldo.disponible ? '🟢 La IA puede responder.' : '🔴 Saldo agotado: el bot responde en modo clásico.'}` });
                 }
@@ -2740,7 +2909,7 @@ async function startBot() {
 
                 // Cliente nuevo preguntando por catálogo / lista de precios / despachos → responder de inmediato
                 if (esPregunta && (mencionaCatalogo || mencionaListaPrecios || mencionaDespacho)) {
-                    let msgBien = `🎉 *¡Bienvenido a ONE4CARS, ${pushName}!* 🎉\n\nSomos *Juan* y *José*, sus asesores de confianza en autopartes.\n\n`;
+                    let msgBien = `👋 *Bienvenido a ONE4CARS, ${pushName}.*\n\nSoy *RODI*, su asistente virtual, con respaldo de nuestro equipo de especialistas.\n\n`;
                     if (mencionaListaPrecios) {
                         msgBien += `💰 *Lista de precios:* https://www.one4cars.com/lista_de_precios.php/\n\n`;
                     }
@@ -2755,7 +2924,7 @@ async function startBot() {
                     return;
                 }
 
-                const msg = `🎉 *¡Bienvenido a ONE4CARS, ${pushName}!* 🎉\n\nSomos *Juan* y *José*, sus asesores de confianza en autopartes. Estamos aquí para ayudarlo con todo lo que necesite, desde filtros y frenos hasta piezas especializadas.\n\n¿En qué podemos servirle el día de hoy? _Escriba la palabra *Menú* para más opciones e información._`;
+                const msg = `👋 *Bienvenido a ONE4CARS, ${pushName}.*\n\nSoy *RODI*, su asistente virtual, con respaldo de nuestro equipo de especialistas. Podemos asistirle con medios de pago, estado de cuenta, precios, pedidos, consulta de productos y seguimiento de despachos.\n\n¿En qué puedo servirle hoy? _Escriba *Menú* para ver todas las opciones._`;
                 await safeSendMessage(from, { text: msg });
                 return;
             }
@@ -2801,9 +2970,9 @@ async function startBot() {
                     await safeSendMessage(from, { text: `¡Buen${saludoBase === 'dia' ? 'os' : 'as'} ${saludoBase}, *${nombreUsuario}*! 🙌\n\n*José* no está disponible en este momento, pero yo puedo atenderle con todo gusto. Somos el mismo equipo ONE4CARS y estamos para servirle.\n\n_Escriba la palabra *Menú* para más opciones e información._` });
                 } else {
                     const respuestas = {
-                        'dia': `¡Buenos días, *${nombreUsuario}*! Dios le bendiga. Es un gusto tenerle por aquí. 🙏\n\n¿En qué podemos servirle el día de hoy? _Escriba la palabra *Menú* para más opciones e información._`,
-                        'tarde': `¡Buenas tardes, *${nombreUsuario}*! Un placer saludarle. Que tenga una bendecida tarde. 😊\n\n¿Cómo podemos ayudarle? _Escriba la palabra *Menú* para más opciones e información._`,
-                        'noche': `¡Buenas noches, *${nombreUsuario}*! Dios le bendiga. Que descanse. 🌙\n\n¿En qué podemos ayudarle? _Escriba la palabra *Menú* para más opciones e información._`
+                        'dia': `Buenos días, *${nombreUsuario}*. Un gusto atenderle. 🙌\n\n¿En qué puedo servirle hoy? _Escriba *Menú* para ver todas las opciones._`,
+                        'tarde': `Buenas tardes, *${nombreUsuario}*. Un placer saludarle. 😊\n\n¿En qué puedo servirle hoy? _Escriba *Menú* para ver todas las opciones._`,
+                        'noche': `Buenas noches, *${nombreUsuario}*. Un gusto atenderle. 🌙\n\n¿En qué puedo servirle hoy? _Escriba *Menú* para ver todas las opciones._`
                     };
                     await safeSendMessage(from, { text: respuestas[saludoBase] });
                 }
@@ -2921,9 +3090,63 @@ async function startBot() {
                 }
             }
 
+            // --- 1d. ENRUTADOR IA: lenguaje natural bajo parámetros ---
+            // La IA decide la acción, pero solo puede ejecutar el catálogo
+            // comandos.json. Los flujos críticos (pedidos, comprobantes, RIF,
+            // comandos de administrador) se conservan deterministas.
+            const esComandoReservado = text === 'top10' || text === 'top 10' || text === 'mas vendidos' ||
+                text === 'top' || text.startsWith('!') || text === 'ia' || text.startsWith('ia ') ||
+                text.startsWith('nota ');
+            if (proceActivo('ia') && !/^\d$/.test(text) && rawText.length <= 500 &&
+                !esComandoReservado && !(isAdmin && esComandoAdministrativo(text)) && !parecePedidoOperativo(rawText)) {
+                try {
+                    let historial = [];
+                    try {
+                        const [h] = await pool.execute("SELECT rol, contenido FROM historial_chat WHERE telefono = ? ORDER BY id DESC LIMIT 4", [from]);
+                        historial = h.reverse().map(x => ({ rol: x.rol, contenido: x.contenido }));
+                        if (historial.length && historial[historial.length - 1].contenido === rawText) historial.pop();
+                    } catch (e) {}
+                    const ctx = {
+                        from,
+                        pushName,
+                        rawText,
+                        nombre: nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName,
+                        telefono: from.split('@')[0],
+                        esAdmin: isAdmin,
+                        vendedor: vendedor ? vendedor.nombre : null,
+                        sesionValidada: !!(sesion && sesion.id_cliente_int),
+                        dolar: dolarInfo,
+                        historial
+                    };
+                    const decision = await aiRouter.decidir(rawText, ctx);
+                    console.log(`[ROUTER] "${rawText.substring(0, 60)}" -> ${decision.accion} (${decision.confianza})`);
+                    if (decision && decision.accion && decision.accion !== 'responder' && decision.confianza >= 0.5) {
+                        const manejado = await ejecutarAccionRouter(decision, ctx);
+                        if (manejado) return;
+                    }
+                    if (decision && decision.accion === 'responder' && decision.respuesta && decision.confianza >= 0.55) {
+                        await responderRouter(from, decision.respuesta);
+                        return;
+                    }
+                } catch (e) {
+                    console.log('[ROUTER] Error:', e.message);
+                }
+            }
+
             // --- 2. DETECCIÓN INTELIGENTE DEL MENÚ ---
             const menuOption = detectarIntencionMenu(text);
             if (menuOption) {
+                if (text === '9') {
+                    const respAsesor = (accionCatalogo('asesor') && accionCatalogo('asesor').respuesta) || 'Un especialista de ONE4CARS revisará su caso y le contactará a la brevedad.';
+                    await responderRouter(from, respAsesor);
+                    try {
+                        const adminJids = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
+                        for (const aj of adminJids) {
+                            await safeSendMessage(aj, { text: `👤 *SOLICITUD DE ASESOR HUMANO*\nCliente: ${nombreAlmacenado || nombreExtraido || pushName || 'No identificado'}\nTeléfono: ${from.split('@')[0]}\nOrigen: menú (opción 9)` });
+                        }
+                    } catch (e) {}
+                    return;
+                }
                 if (menuOption.includes('Estado de cuenta')) {
                     const targetID = sesion?.id_cliente_int;
                     if (!targetID) {
@@ -2984,7 +3207,7 @@ async function startBot() {
                             if (v.zona !== zonaAct) { zonaAct = v.zona; reporte += `\n📍 *${zonaAct || 'Sin zona'}*\n`; }
                             reporte += `  ${i+1}. ${v.nombres} ${v.hora ? '🕐'+v.hora.substring(0,5) : ''}\n     📞 ${v.celular || '—'}\n`;
                         });
-                        reporte += `\n🔗 ${process.env.BASE_URL || 'https://bot-whatsapp-gratis-mq8u.onrender.com'}/visitas?fecha=${hoyStr}`;
+                        reporte += `\n🔗 ${process.env.BASE_URL || 'https://bot.95-111-228-86.sslip.io'}/visitas?fecha=${hoyStr}`;
                         return await safeSendMessage(from, { text: reporte });
                     } catch (e) {
                         console.log("[VISITAS HOY] Error:", e.message);
@@ -4839,6 +5062,69 @@ const server = http.createServer(async (req, res) => {
             procesos: procesosEstado,
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-intent') {
+        try {
+            const texto = query.texto || '';
+            const decision = await aiRouter.decidir(texto, {
+                nombre: 'Cliente de prueba',
+                telefono: 'test',
+                esAdmin: false,
+                vendedor: null,
+                sesionValidada: false,
+                dolar: dolarInfo,
+                historial: []
+            });
+            const accion = (aiRouter.cargarCatalogo().acciones || []).find(a => a.id === decision.accion) || null;
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ texto, decision, accion }, null, 2));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }));
+        }
+    } else if (routename === '/entrenar-ejemplo' && req.method === 'POST') {
+        let b = '';
+        req.on('data', c => b += c);
+        req.on('end', async () => {
+            try {
+                const params = new URLSearchParams(b);
+                const accion = (params.get('accion') || '').trim();
+                const mensaje = (params.get('mensaje') || '').trim().slice(0, 300);
+                const cat = aiRouter.cargarCatalogo();
+                if (!cat.acciones.some(a => a.id === accion)) throw new Error('Acción inválida');
+                if (!mensaje) throw new Error('Mensaje vacío');
+                if (!cat.entrenamiento) cat.entrenamiento = { ejemplos_por_accion: {} };
+                if (!cat.entrenamiento.ejemplos_por_accion) cat.entrenamiento.ejemplos_por_accion = {};
+                const arr = cat.entrenamiento.ejemplos_por_accion[accion] || [];
+                if (!arr.includes(mensaje)) arr.push(mensaje);
+                if (arr.length > 50) arr.splice(0, arr.length - 50);
+                cat.entrenamiento.ejemplos_por_accion[accion] = arr;
+                const data = aiRouter.guardarCatalogo(cat);
+                await guardarComandosBD(JSON.stringify(data));
+                res.writeHead(302, { Location: '/entrenar?action=ejemplo' });
+                res.end();
+            } catch (e) {
+                console.log("[ENTRENAR] Error guardando ejemplo:", e.message);
+                res.writeHead(302, { Location: '/entrenar?action=error' });
+                res.end();
+            }
+        });
+    } else if (routename === '/entrenar-comandos' && req.method === 'POST') {
+        let b = '';
+        req.on('data', c => b += c);
+        req.on('end', async () => {
+            try {
+                const params = new URLSearchParams(b);
+                const texto = params.get('comandos') || '';
+                const data = aiRouter.guardarCatalogo(texto);
+                await guardarComandosBD(JSON.stringify(data));
+                res.writeHead(302, { Location: '/entrenar?action=comandos' });
+                res.end();
+            } catch (e) {
+                console.log("[ENTRENAR] Error guardando comandos:", e.message);
+                res.writeHead(302, { Location: '/entrenar?action=error' });
+                res.end();
+            }
+        });
     } else if (routename === '/entrenar' && req.method === 'POST') {
         let b = '';
         req.on('data', c => b += c);
@@ -4877,8 +5163,11 @@ const server = http.createServer(async (req, res) => {
                 </div>
             </div>`;
         }).join('');
-        const linkDeploy = 'https://dashboard.render.com/web/srv-d9v94m3l550s7381avog';
-        const linkCron = 'https://console.cron-job.org/jobs';
+        const catalogoActual = JSON.stringify(aiRouter.cargarCatalogo(), null, 2);
+        const accionesOptions = (aiRouter.cargarCatalogo().acciones || []).map(a => `<option value="${a.id}">${a.id} — ${a.titulo || ''}</option>`).join('');
+        const decisiones = aiRouter.ultimasDecisiones(12);
+        const escHtml = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const decisionesHtml = decisiones.length ? decisiones.map(d => `<tr><td class="text-white-50"><code>${escHtml((d.fecha || '').slice(11, 19))}</code></td><td>${escHtml((d.mensaje || '').slice(0, 90))}</td><td><span class="badge bg-primary">${escHtml(d.accion || '')}</span></td><td>${Number(d.confianza || 0).toFixed(2)}</td></tr>`).join('') : '<tr><td colspan="4" class="text-white-50">Aún no hay decisiones registradas.</td></tr>';
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(`<!DOCTYPE html>
 <html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -4899,12 +5188,12 @@ body{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh
 ${header}
 <div class="container pb-4">
 <div class="row g-3 mb-3">
-<div class="col-md-4"><a href="${linkDeploy}" target="_blank" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
-<div class="fw-bold mb-1"><i class="bi bi-rocket-takeoff me-1"></i> Render (Deploy)</div>
-<small class="link-ext">dashboard.render.com/web/srv-d9v94m3l550s7381avog</small></a></div>
-<div class="col-md-4"><a href="${linkCron}" target="_blank" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
-<div class="fw-bold mb-1"><i class="bi bi-clock-history me-1"></i> cron-job.org (Conexión)</div>
-<small class="link-ext">console.cron-job.org/jobs</small></a></div>
+<div class="col-md-4"><a href="https://bot.95-111-228-86.sslip.io" target="_blank" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
+<div class="fw-bold mb-1"><i class="bi bi-server me-1"></i> Servidor VPS · Contabo</div>
+<small class="link-ext">Producción 24/7 · sin cron de Render</small></a></div>
+<div class="col-md-4"><div class="card-dash p-3 h-100">
+<div class="fw-bold mb-1"><i class="bi bi-arrow-repeat me-1"></i> PM2 · Auto-reinicio</div>
+<small class="link-ext">Supervisión y arranque automático</small></div></div>
 <div class="col-md-4"><a href="/sql" class="card-dash d-block p-3 h-100 text-decoration-none" style="color:#fff">
 <div class="fw-bold mb-1"><i class="bi bi-database me-1"></i> Consultas SQL</div>
 <small class="link-ext">Explora las tablas y haz consultas de lectura</small></a></div>
@@ -4915,6 +5204,8 @@ ${isBotReady() ? '<span class="badge bg-success" style="border-radius:20px">🟢
 <button class="btn btn-sm btn-outline-light ms-2" style="border-radius:10px" onclick="location.href='/ping'">Ver /ping</button>
 </div></div></div>
 ${accion === 'guardado' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Entrenamiento del bot guardado. La IA lo usará inmediatamente.</div>' : ''}
+${accion === 'comandos' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Órdenes fijas y ejemplos guardados. El asistente los usará en la próxima conversación.</div>' : ''}
+${accion === 'ejemplo' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Ejemplo agregado al entrenamiento. El asistente lo usará como referencia.</div>' : ''}
 ${accion === 'seguir' ? '<div class="alert alert-success py-2" style="border-radius:12px">✅ Proceso actualizado.</div>' : ''}
 ${accion === 'runok' ? '<div class="alert alert-info py-2" style="border-radius:12px">▶ Proceso ejecutado. Revisa el dashboard/historial para ver resultados.</div>' : ''}
 ${accion === 'botoff' ? '<div class="alert alert-warning py-2" style="border-radius:12px">⚠️ El bot de WhatsApp está offline; no se pudo ejecutar el proceso.</div>' : ''}
@@ -4941,8 +5232,69 @@ ${procesosRows}
 </div>
 </div>
 </div>
+
+<!-- ÓRDENES FIJAS Y ENTRENAMIENTO AVANZADO -->
+<div class="row g-3 mt-1">
+<div class="col-lg-7">
+<div class="card-dash p-4">
+<h5 class="mb-1"><i class="bi bi-diagram-3 me-2"></i>Órdenes fijas y parámetros (comandos.json)</h5>
+<p class="text-white-50 small mb-3">Aquí defines las acciones permitidas, los enlaces oficiales y los ejemplos reales de sus clientes. El asistente puede conversar con libertad, pero solo ejecuta estas acciones. El JSON debe ser válido.</p>
+<form method="POST" action="/entrenar-comandos">
+<textarea class="form-control txt-ia mb-3" name="comandos" rows="26">${catalogoActual.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea>
+<div class="d-flex gap-2 flex-wrap">
+<button class="btn btn-acc px-4" type="submit"><i class="bi bi-save me-1"></i>Guardar órdenes fijas</button>
+<span class="text-white-50 small align-self-center">Se guarda en disco y en la base de datos.</span>
+</div>
+</form>
+</div>
+</div>
+<div class="col-lg-5">
+<div class="card-dash p-4 mb-3">
+<h5 class="mb-2"><i class="bi bi-chat-square-text me-2"></i>Probar decisión de la IA</h5>
+<p class="text-white-50 small mb-2">Escriba un mensaje como lo haría un cliente y vea qué acción elige el asistente, sin enviar nada por WhatsApp.</p>
+<div class="input-group mb-2">
+<input id="testTexto" class="form-control txt-ia" style="font-family:inherit" placeholder="Ej: ¿Cuánto debo de la factura del cliente?">
+<button class="btn btn-acc" type="button" onclick="probarIA()">Probar</button>
+</div>
+<pre id="testResultado" class="txt-ia p-3 mb-0" style="max-height:260px;overflow:auto;white-space:pre-wrap">El resultado aparecerá aquí.</pre>
+</div>
+<div class="card-dash p-4">
+<h5 class="mb-2"><i class="bi bi-activity me-2"></i>Últimas decisiones</h5>
+<p class="text-white-50 small mb-2">Registro de lo que decidió la IA. Úselo para detectar mensajes que necesitan un nuevo ejemplo de entrenamiento.</p>
+<div class="table-responsive" style="max-height:280px;overflow:auto">
+<table class="table table-sm table-dark align-middle mb-0" style="font-size:.78rem">
+<thead><tr><th>Hora</th><th>Mensaje</th><th>Acción</th><th>Conf.</th></tr></thead>
+<tbody>${decisionesHtml}</tbody>
+</table>
+</div>
+</div>
+<div class="card-dash p-4 mt-3">
+<h5 class="mb-2"><i class="bi bi-plus-circle me-2"></i>Agregar ejemplo de entrenamiento</h5>
+<p class="text-white-50 small mb-2">Si la IA eligió una acción incorrecta, escriba la frase real del cliente y seleccione la acción correcta. Se usará en la próxima conversación.</p>
+<form method="POST" action="/entrenar-ejemplo" class="row g-2">
+<div class="col-12"><select name="accion" class="form-select txt-ia" style="font-family:inherit">${accionesOptions}</select></div>
+<div class="col-12"><input name="mensaje" class="form-control txt-ia" style="font-family:inherit" placeholder="Ej: ¿Me pasas el saldo de la factura 1234?" required></div>
+<div class="col-12"><button class="btn btn-acc w-100" type="submit"><i class="bi bi-plus-lg me-1"></i>Agregar ejemplo</button></div>
+</form>
+</div>
+</div>
+</div>
+</div>
+
 </div>
 <script>
+async function probarIA(){
+    const t=document.getElementById('testTexto').value.trim();
+    if(!t)return;
+    const out=document.getElementById('testResultado');
+    out.textContent='Consultando...';
+    try{
+        const r=await fetch('/test-intent?texto='+encodeURIComponent(t));
+        const j=await r.json();
+        out.textContent=JSON.stringify(j,null,2);
+    }catch(e){ out.textContent='Error: '+e.message; }
+}
+
 async function toggleProc(id){
     if(!confirm('¿Cambiar el estado del proceso?'))return;
     const r=await fetch('/procesos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
@@ -5412,7 +5764,7 @@ document.querySelectorAll('#frecSel, #zonaSel, #fechaSel').forEach(el => {
     }
 });
 
-server.listen(PORT, '0.0.0.0', async () => {
+server.listen(PORT, process.env.BIND_HOST || '0.0.0.0', async () => {
     await initDB();
     await cargarConfigBD();
     await restaurarSesiones();
