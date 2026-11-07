@@ -2067,6 +2067,8 @@ function parecePedidoOperativo(rawText) {
     if (detectarTransferencia(rawText)) return true;
     if (/(?:^|\s)\d{1,4}\s*(?:x|por|unidades?|und\.?)\s*[A-Za-z0-9-]{3,}/i.test(rawText)) return true;
     if (/(?:^|\s)\d{1,4}\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]{4,}/.test(rawText)) return true;
+    if (/\b[A-Za-z0-9]{3,}\s*[-=]\s*\d{1,4}\b/.test(rawText)) return true;
+    if (/\b\d{1,4}\s*[-=]\s*[A-Za-z0-9]{3,}\b/.test(rawText)) return true;
     if (/[A-Za-z]{2,}\d{2,}/.test(rawText) && /\b\d{1,4}\b/.test(rawText)) return true;
     if (/\b(ya\s+pagu[eé]|pagu[eé]|envi[eé]\s+el\s+pago|adjunto\s+pago|comprobante|referencia|transferencia|pago\s+m[oó]vil|dep[oó]sito)\b/i.test(rawText)) return true;
     return false;
