@@ -1240,6 +1240,15 @@ function linkReporteFactura(f) {
     return `https://one4cars.com/sevencorp/factura_full_reporte_web.php?${params}`;
 }
 
+/** Detecta preguntas analíticas que deben resolverse con SQL generado por IA. */
+function pareceConsultaAnalitica(raw) {
+    const t = normalizar(raw);
+    if (/(factura|deuda|cartera|cobrar|cobranza|mora|vencid|saldo|vendi|venta|compras?|ranking|promedio|top\s*\d)/.test(t)) return true;
+    if (/(cuantos?|cuantas?|que cliente|cual cliente|quien|clientes con)/.test(t) &&
+        /(debe|deben|compro|compraron|vendio|vendieron|factur)/.test(t)) return true;
+    return false;
+}
+
 /** Procesa consultas rápidas del dueño. Devuelve true si ya respondió. */
 async function atenderConsultaDueno(from, rawText, isAdmin) {
     const t = String(rawText || '').trim();
@@ -3837,6 +3846,18 @@ async function startBot() {
                     await safeSendMessage(from, { text: '📊 Consultando los datos...' });
                     const respuesta = await reportesIA.preguntar(pregunta);
                     return await safeSendMessage(from, { text: respuesta });
+                }
+            }
+
+            // --- 0a3bis. PREGUNTAS ANALÍTICAS SIN PREFIJO (ADMIN) ---
+            if (isAdmin && rawText.length <= 300 && pareceConsultaAnalitica(rawText) &&
+                !['top10', 'top 10', 'top', 'mas vendidos'].includes(text) && !text.startsWith('!')) {
+                try {
+                    await safeSendMessage(from, { text: '📊 Consultando los datos...' });
+                    const respuesta = await reportesIA.preguntar(rawText);
+                    return await safeSendMessage(from, { text: respuesta });
+                } catch (e) {
+                    console.log('[REPORTE-AUTO] Error:', e.message);
                 }
             }
 

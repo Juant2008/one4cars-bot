@@ -132,8 +132,9 @@ REGLAS:
 - Solo SELECT. Una sola sentencia. Sin INSERT/UPDATE/DELETE/DROP/ALTER.
 - Usa solo las tablas del esquema. No uses information_schema.
 - Precios: tab_productos.precio_minimo está en USD. Stock = cantidad_existencia + cantidad_existencia_almacen.
-- Valores reales: tab_productos.activo = 'si' (no 1); tab_facturas.pagada = 'SI' o 'NO' y anulado = 'no' o 'si'; tab_clientes.activo = 'si' cuando exista. Si dudas de un valor, usa DISTINCT antes de filtrar.
-- Facturas: tab_facturas.total, abono_factura, porcentaje, pagada, anulado, fecha_reg.
+- Saldo de una factura = (total - abono_factura). NO dividir por porcentaje. total ya está en USD.
+- Facturas pendientes: pagada = 'NO' AND anulado = 'no'. Facturas vencidas: además fecha_reg <= DATE_SUB(CURDATE(), INTERVAL 30 DAY).
+- Clientes: tab_clientes (nombres, celular, clave = RIF sin letra, cedula = RIF con letra, vendedor, tipo, zona, activo).
 - Pedidos: tab_pedidos y tab_pedidos_reng.
 - Visitas: tab_agenda_visitas.
 - Leads mayoristas: bot_leads.
