@@ -242,6 +242,7 @@ const campanias = require('./campanias');
 const colaEnvios = require('./cola_envios');
 const automatizaciones = require('./automatizaciones');
 const aprendizaje = require('./aprendizaje');
+const rutas = require('./rutas');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
@@ -267,6 +268,7 @@ catalogoTecnico.init(pool);
 reportesIA.init(pool);
 licencia.init(pool);
 aprendizaje.init(pool);
+rutas.init(pool);
 automatizaciones.init(pool, {
     enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
     format: formatWhatsApp,
@@ -1281,6 +1283,18 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
+        // 1z) Ruta de venta del día
+        if (/(?:a\s+d[oó]nde\s+(?:deber[ií]a\s+|debo\s+|me\s+conviene\s+)?(?:vender|ir|visitar)|qu[eé]\s+zona[s]?\s+(?:deber[ií]a\s+|debo\s+)?(?:vender|visitar|atender)|ruta\s+(?:de\s+)?(?:hoy|del\s+d[ií]a|de\s+ventas|de\s+visitas)|plan\s+de\s+(?:ventas|visitas)|d[oó]nde\s+vendo\s+hoy|d[oó]nde\s+vender\s+hoy)/i.test(t)) {
+            await safeSendMessage(from, { text: await rutas.textoRuta() });
+            return true;
+        }
+        const mZona = t.match(/^ruta\s+(?!de\s+hoy\b|del\s+d[ií]a\b|hoy\b|de\s+ventas\b|de\s+visitas\b)(.+)$/i);
+        if (mZona) {
+            const zonaTerm = mZona[1].replace(/[?.!]+$/g, '').trim();
+            await safeSendMessage(from, { text: await rutas.textoZona(zonaTerm) });
+            return true;
+        }
+
         // 2a) Estado de cuenta de un vendedor
         const mVendEc = t.match(/estado de cuenta\s+(?:del?\s+)?vendedor\s+(.+)/i)
             || t.match(/(?:cartera|cuentas? por cobrar)\s+(?:del?\s+)?(?:vendedor\s+)?(.+)/i);
@@ -6171,6 +6185,21 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-ruta') {
+        try {
+            if (query.zona) {
+                const txt = await rutas.textoZona(query.zona);
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: true, zona: query.zona, texto: txt }, null, 2));
+            }
+            const texto = await rutas.textoRuta();
+            const ranking = await rutas.rankingZonas(8);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, ranking, texto }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
     } else if (routename === '/test-aprender') {
         try {
             const texto = query.texto || '';
