@@ -241,6 +241,7 @@ const licencia = require('./licencia');
 const campanias = require('./campanias');
 const colaEnvios = require('./cola_envios');
 const automatizaciones = require('./automatizaciones');
+const aprendizaje = require('./aprendizaje');
 
 // CONFIGURACION
 const PORT = process.env.PORT || 10000;
@@ -265,6 +266,7 @@ const pool = mysql.createPool({
 catalogoTecnico.init(pool);
 reportesIA.init(pool);
 licencia.init(pool);
+aprendizaje.init(pool);
 automatizaciones.init(pool, {
     enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
     format: formatWhatsApp,
@@ -282,6 +284,7 @@ colaEnvios.initCompleto(pool, {
     enviar: async (jid, texto) => { await safeSendMessage(jid, { text: texto }); },
     format: formatWhatsApp
 }).then(() => automatizaciones.initTablas()).catch(e => console.log('[COLA] Init:', e.message));
+aprendizaje.initTablas().catch(e => console.log('[APRENDER] Init:', e.message));
 const poolLocal = mysql.createPool({
     host: process.env.LOCAL_DB_HOST || '127.0.0.1',
     user: process.env.LOCAL_DB_USER || process.env.DB_USER || 'juant200_one4car',
@@ -2635,6 +2638,7 @@ async function responderProductosIA(from, busqueda) {
         try { prods = await buscarProductoPorTexto(consultaBusqueda); } catch (e) {}
     }
     if (!prods || !prods.length) {
+        aprendizaje.registrarDuda(from, consulta, 'producto');
         return await responderRouter(from, `No encontré una coincidencia exacta para "*${consulta.slice(0, 80)}*" en el inventario.\n\nPara confirmar precio y disponibilidad, indíqueme:\n• Pieza\n• Marca, modelo y año del vehículo\n• Cantidad\n\nTambién puede consultar el catálogo: https://www.one4cars.com/consulta_productos.php/`);
     }
     automatizaciones.registrarInteres(from, consulta);
@@ -3732,6 +3736,57 @@ async function startBot() {
                 }
             }
 
+            // --- 0a3b. APRENDIZAJE DEL BOT (ADMIN) ---
+            if (isAdmin && (text === 'dudas' || text === 'aprendizaje' || text === 'aprende' ||
+                text.startsWith('aprende ') || text.startsWith('aprender ') ||
+                text.startsWith('ensenar ') || text.startsWith('enseñar ') || text.startsWith('olvidar '))) {
+                try {
+                    if (text === 'dudas') {
+                        const rows = await aprendizaje.dudas(20);
+                        if (!rows.length) return await safeSendMessage(from, { text: '✅ No hay preguntas pendientes de enseñar.' });
+                        let msg = '❓ *PREGUNTAS SIN RESPUESTA*\n\n';
+                        rows.forEach(d => {
+                            msg += `*${d.id}.* ${String(d.pregunta).slice(0, 120)}\n   ${d.motivo || ''} · ${new Date(d.fecha).toLocaleDateString('es-VE')}\n`;
+                        });
+                        msg += `\nEnseñar: *enseñar ID => respuesta*`;
+                        return await safeSendMessage(from, { text: msg });
+                    }
+                    if (text === 'aprendizaje') {
+                        const rows = await aprendizaje.listar(30);
+                        if (!rows.length) return await safeSendMessage(from, { text: '📚 Todavía no hay respuestas aprendidas.' });
+                        let msg = '📚 *RESPUESTAS APRENDIDAS*\n\n';
+                        rows.forEach(r => {
+                            msg += `*${r.id}.* ${String(r.patron).slice(0, 90)}\n   ↳ ${String(r.respuesta).slice(0, 90)}… · usada ${r.veces} vez(ces)\n`;
+                        });
+                        msg += `\nOlvidar: *olvidar ID*`;
+                        return await safeSendMessage(from, { text: msg });
+                    }
+                    if (text.startsWith('enseñar ') || text.startsWith('ensenar ')) {
+                        const cuerpo = rawText.replace(/^enseñar\s+/i, '').replace(/^ensenar\s+/i, '');
+                        const m = cuerpo.match(/^(\d+)\s*(?:=>|->|\|)\s*([\s\S]+)$/);
+                        if (!m) return await safeSendMessage(from, { text: 'Uso: *enseñar 12 => respuesta que debe dar*' });
+                        const pregunta = await aprendizaje.ensenarDuda(parseInt(m[1], 10), m[2].trim());
+                        if (!pregunta) return await safeSendMessage(from, { text: `No encontré la duda *${m[1]}*.` });
+                        return await safeSendMessage(from, { text: `✅ Aprendido.\n\nCuando pregunten:\n_"${pregunta.slice(0, 120)}"_\nresponderé lo que me indicó.` });
+                    }
+                    if (text.startsWith('olvidar ')) {
+                        const id = parseInt(rawText.replace(/^olvidar\s+/i, '').trim(), 10);
+                        const n = await aprendizaje.olvidar(id);
+                        return await safeSendMessage(from, { text: n ? `🗑️ Respuesta aprendida *${id}* desactivada.` : `No encontré la respuesta *${id}*.` });
+                    }
+                    // aprende pregunta => respuesta
+                    const cuerpo = rawText.replace(/^aprender\s+/i, '').replace(/^aprende\s+/i, '');
+                    const par = aprendizaje.parsePar(cuerpo);
+                    if (!par) {
+                        return await safeSendMessage(from, { text: 'Uso:\n*aprende pregunta => respuesta*\n\nEjemplo:\n_aprende horario => Atendemos de lunes a viernes de 8:00 a 17:00._' });
+                    }
+                    await aprendizaje.guardar(par.patron, par.respuesta, from.split('@')[0]);
+                    return await safeSendMessage(from, { text: `🧠 Aprendido.\n\nCuando pregunten algo parecido a:\n_"${par.patron.slice(0, 120)}"_\nresponderé:\n${par.respuesta.slice(0, 300)}` });
+                } catch (e) {
+                    return await safeSendMessage(from, { text: `❌ Error de aprendizaje: ${e.message}` });
+                }
+            }
+
             // --- 0a4. CAMPAÑAS DE RECUPERACIÓN (ADMIN) ---
             if (isAdmin && (text.startsWith('campana ') || text === 'campana' || text === 'resumen' || text.startsWith('campania '))) {
                 try {
@@ -4029,6 +4084,18 @@ async function startBot() {
                 }
             }
 
+            // --- 1c2. RESPUESTAS APRENDIDAS (sin IA) ---
+            if (proceActivo('ia') && rawText && rawText.length <= 500) {
+                try {
+                    const aprendido = await aprendizaje.buscar(rawText);
+                    if (aprendido) {
+                        console.log(`[APRENDER] Respuesta aprendida #${aprendido.id} para "${rawText.substring(0, 50)}"`);
+                        await responderRouter(from, aprendido.respuesta);
+                        return;
+                    }
+                } catch (e) {}
+            }
+
             // --- 1d. ENRUTADOR IA: lenguaje natural bajo parámetros ---
             // La IA decide la acción, pero solo puede ejecutar el catálogo
             // comandos.json. Los flujos críticos (pedidos, comprobantes, RIF,
@@ -4059,6 +4126,9 @@ async function startBot() {
                     };
                     const decision = await aiRouter.decidir(rawText, ctx);
                     console.log(`[ROUTER] "${rawText.substring(0, 60)}" -> ${decision.accion} (${decision.confianza})`);
+                    if (decision && decision.accion === 'aclarar') {
+                        await aprendizaje.registrarDuda(from, rawText, 'aclarar');
+                    }
                     if (decision && decision.accion && decision.accion !== 'responder' && decision.confianza >= 0.5) {
                         const manejado = await ejecutarAccionRouter(decision, ctx);
                         if (manejado) return;
@@ -6080,6 +6150,22 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-aprender') {
+        try {
+            const texto = query.texto || '';
+            if (query.guardar === '1' && query.patron && query.respuesta) {
+                const id = await aprendizaje.guardar(query.patron, query.respuesta, 'test');
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: true, guardado: id }, null, 2));
+            }
+            const hit = await aprendizaje.buscar(texto);
+            const pendientes = await aprendizaje.dudas(10);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, texto, encontrado: hit || null, dudas: pendientes }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
     } else if (routename === '/test-consulta') {
         try {
             if (!isBotReady()) {
