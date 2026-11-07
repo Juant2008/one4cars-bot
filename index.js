@@ -3748,7 +3748,10 @@ async function startBot() {
             }
 
             // --- 0a00. MENÚ DEL GERENTE (solo la palabra "comandos") ---
-            if (isAdmin && (text === 'comandos' || text === 'comandos admin' || text === 'menu comandos' || text === 'menu gerente')) {
+            const textoMenu = String(rawText || '')
+                .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                .toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+            if (isAdmin && /^(comandos|comandos admin|menu comandos|menu gerente)$/.test(textoMenu)) {
                 return await safeSendMessage(from, { text: menuGerente() });
             }
 
