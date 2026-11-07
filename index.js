@@ -385,6 +385,7 @@ const pendienteFactura = new Map();
 const lastFallbackSent = new Map();
 const FALLBACK_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutos
 const lastMessageTimes = new Map(); // Evitar respuestas duplicadas
+const processedMessageIds = new Map(); // Evitar procesar dos veces el mismo ID de WhatsApp
 const licenciaAvisos = new Map(); // Evitar spam cuando la licencia está inactiva
 const DUPLICATE_COOLDOWN_MS = 10000; // 10 segundos
 
@@ -2972,6 +2973,22 @@ async function startBot() {
             const from = msg.key.remoteJid;
             if (from === 'status@broadcast' || from.includes('@g.us')) return;
 
+            // Deduplicación por ID de mensaje: evita procesar dos veces el mismo
+            // mensaje cuando WhatsApp reenvía el evento o hay reconexiones.
+            const mid = msg.key && msg.key.id;
+            if (mid) {
+                const previo = processedMessageIds.get(mid);
+                if (previo && Date.now() - previo < 5 * 60 * 1000) {
+                    console.log(`[DEDUP] Mensaje ${mid} ya procesado; se ignora.`);
+                    return;
+                }
+                processedMessageIds.set(mid, Date.now());
+                if (processedMessageIds.size > 2000) {
+                    const exp = Date.now() - 5 * 60 * 1000;
+                    for (const [k, v] of processedMessageIds) { if (v < exp) processedMessageIds.delete(k); }
+                }
+            }
+
             const isAdmin = ADMIN_IDS.some(id => from.includes(id));
             const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
 
@@ -3018,8 +3035,6 @@ async function startBot() {
             const textoLimpioParaRif = rawText.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
             const esRIFPuro = /^[VJGE]\d{8,9}$/.test(textoLimpioParaRif);
 
-            await guardarMensaje(from, 'user', rawText);
-
             // Evitar respuestas duplicadas (mismo texto, mismo remitente, en menos de 10 segundos)
             const msgKey = `${from}:${rawText}`;
             const ahoraMs = Date.now();
@@ -3034,6 +3049,8 @@ async function startBot() {
                 const exp = ahoraMs - 60000;
                 for (const [k, v] of lastMessageTimes) { if (v < exp) lastMessageTimes.delete(k); }
             }
+
+            await guardarMensaje(from, 'user', rawText);
 
             // Ignorar auto-reply de clientes (mensajes automáticos de bienvenida)
             const rawLower = rawText.toLowerCase();
