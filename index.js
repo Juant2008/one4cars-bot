@@ -1123,7 +1123,7 @@ async function notificarLeadMayorista(from, nombre, mensaje) {
     } catch (e) {}
 }
 
-const TEXTO_REGISTRO_MAYORISTA = `🏢 *REGISTRO DE CLIENTE MAYORISTA ONE4CARS*\n\nGracias por su interés en nuestros productos. Trabajamos exclusivamente al mayor, con una compra mínima de *USD 100*.\n\nPara registrar su empresa necesitamos:\n1. Copia del RIF de la empresa.\n2. Foto del local.\n3. Dirección fiscal.\n4. Nombre del dueño.\n\nPuede enviar estos datos por este chat o completar el registro aquí:\nhttps://www.one4cars.com/afiliar_clientes.php/\n\nUn asesor validará su información y le activará la cuenta. Si lo desea, indíqueme el nombre de su empresa y qué productos necesita.`;
+const TEXTO_REGISTRO_MAYORISTA = `🏢 *REGISTRO DE CLIENTE MAYORISTA ONE4CARS*\n\nGracias por su interés en nuestros productos. Trabajamos exclusivamente al mayor, con una compra mínima de *USD 100*.\n\nPara registrar su empresa necesitamos:\n1. Copia del RIF de la empresa.\n2. Foto del local.\n3. Dirección fiscal.\n4. Nombre del dueño.\n\nPuede enviar estos datos por este chat o completar el registro aquí:\nhttps://www.one4cars.com/afiliar_clientes.php/\n\nSi ya es cliente, envíe su RIF por este chat para identificarle y evitar el registro.\n\nUn asesor validará su información y le activará la cuenta. Si lo desea, indíqueme el nombre de su empresa y qué productos necesita.`;
 
 async function enviarRegistroMayorista(from, pushName, rawText, sesion) {
     if (await esClienteRegistrado(from, sesion)) {
@@ -1131,6 +1131,10 @@ async function enviarRegistroMayorista(from, pushName, rawText, sesion) {
         return true;
     }
     await responderRouter(from, TEXTO_REGISTRO_MAYORISTA);
+    try {
+        const ses = await getSesion(from);
+        if (!ses) await guardarUsuario(from, pushName || 'Interesado', 0);
+    } catch (e) {}
     await guardarLeadMayorista(from, pushName, rawText);
     await notificarLeadMayorista(from, pushName, rawText);
     return true;
@@ -3316,7 +3320,16 @@ async function startBot() {
                         return await safeSendMessage(from, { text: "❌ No se encontró ningún cliente con ese RIF." });
                     }
                 } else {
-                    return await safeSendMessage(from, { text: "❌ La consulta de estado de cuenta mediante RIF es una función exclusiva para administradores." });
+                    // Cliente / interesado: el RIF sirve para identificarse o iniciar registro.
+                    const rifLimpio = limpiarRIF(rawText);
+                    const c = await buscarCliente(rifLimpio);
+                    if (c) {
+                        await guardarUsuario(from, rifLimpio, c.id_cliente);
+                        return await safeSendMessage(from, { text: `✅ *RIF identificado.* Su empresa está registrada en ONE4CARS y ya puede comprar al mayor (mínimo USD 100).\n\n¿Qué producto o repuesto necesita? Puede indicarme pieza, marca, modelo y año del vehículo.` });
+                    }
+                    await guardarLeadMayorista(from, 'RIF enviado', `RIF: ${rifLimpio}`);
+                    await notificarLeadMayorista(from, 'RIF enviado', `RIF: ${rifLimpio}`);
+                    return await safeSendMessage(from, { text: `No encontré el RIF *${rifLimpio}* en nuestra base de clientes.\n\n${TEXTO_REGISTRO_MAYORISTA}` });
                 }
             }
 
