@@ -176,9 +176,15 @@ async function tick(opciones = {}) {
             if (hora < config.hora_inicio || hora >= config.hora_fin) return;
         }
         const esperaMs = Math.max(1, Number(config.intervalo_min) || 30) * 60000;
-        if (!opciones.ignorarIntervalo && ultimoEnvioMs && Date.now() - ultimoEnvioMs < esperaMs) return;
+        // Reparto inteligente: si el cupo diario es bajo, separar los mensajes
+        // a lo largo de la jornada (ej. 5/día en 10h = 1 cada 2 horas).
+        const ventanaMin = Math.max(60, (Number(config.hora_fin) - Number(config.hora_inicio)) * 60);
+        const cupo = Math.max(1, Number(config.max_dia) || 5);
+        const separacionMin = Math.max(Number(config.intervalo_min) || 30, Math.round(ventanaMin / cupo));
+        const esperaRealMs = separacionMin * 60000;
+        if (!opciones.ignorarIntervalo && ultimoEnvioMs && Date.now() - ultimoEnvioMs < esperaRealMs) return;
         const enviados = await enviadosHoy();
-        if (!opciones.ignorarCuota && enviados >= (Number(config.max_dia) || 5)) return;
+        if (!opciones.ignorarCuota && enviados >= cupo) return;
 
         const item = await siguiente();
         if (!item) return;
@@ -227,6 +233,9 @@ async function estado() {
     msg += `Modo: *${config.modo_prueba ? 'PRUEBA → 584123715550' : 'REAL'}*\n`;
     msg += `Ritmo: *1 mensaje cada ${config.intervalo_min} min*\n`;
     msg += `Máximo diario: *${config.max_dia}*\n`;
+    const ventanaMin = Math.max(60, (Number(config.hora_fin) - Number(config.hora_inicio)) * 60);
+    const separacion = Math.max(Number(config.intervalo_min) || 30, Math.round(ventanaMin / Math.max(1, Number(config.max_dia) || 5)));
+    msg += `Separación efectiva: *1 cada ${separacion} min* (repartido en la jornada)\n`;
     msg += `Días: *lunes a viernes*\n`;
     msg += `Horario: *${config.hora_inicio}:00 a ${config.hora_fin}:00*\n\n`;
     msg += `Enviados hoy: *${Number(enviados[0] ? enviados[0].n : 0)}*\n`;
