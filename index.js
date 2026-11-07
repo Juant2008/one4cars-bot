@@ -4520,6 +4520,36 @@ const server = http.createServer(async (req, res) => {
             }
             res.end("OK");
         });
+    } else if (routename === '/send' && req.method === 'POST') {
+        let b = '';
+        req.on('data', c => b += c);
+        req.on('end', async () => {
+            try {
+                if (!isBotReady()) {
+                    res.writeHead(503, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ ok: false, error: 'bot no conectado' }));
+                }
+                const data = JSON.parse(b || '{}');
+                const toRaw = data.to || data.telefono || '';
+                const body = String(data.body || data.mensaje || '').trim();
+                const jid = formatWhatsApp(toRaw);
+                if (!jid || !body) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ ok: false, error: 'to y body requeridos' }));
+                }
+                registrarEnvioBot(jid, body);
+                await socketBot.sendMessage(jid, { text: body });
+                try { await guardarMensaje(jid, 'model', body); } catch (e) {}
+                await reactivarChat(jid);
+                console.log(`[API-SEND] Mensaje enviado a ${jid}`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, to: jid }));
+            } catch (e) {
+                console.log('[API-SEND] Error:', e.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: e.message }));
+            }
+        });
     } else if (routename === '/qr.json') {
         const connected = isBotReady() || qrCodeData === 'ONLINE ✅';
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
