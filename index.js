@@ -1396,8 +1396,29 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             || t.match(/clientes?\s+que\s+(?:compraron|han\s+comprado)\s+(.+)/i)
             || t.match(/(?:a\s+qui[eé]n(?:es)?\s+(?:le\s+)?(?:hemos?\s+)?vendido)\s+(.+)/i);
         if (mCompra) {
-            const term = mCompra[1].replace(/[?.!"'“”]+$/g, '').replace(/^["'“”]+/, '').trim();
+            let term = mCompra[1].replace(/[?.!"'“”]+$/g, '').replace(/^["'“”]+/, '').trim();
+            const anioActual = new Date().getFullYear();
+            let year = null, month = null, days = null, periodo = '';
+            if (/este\s+a[nñ]o/i.test(term)) { year = anioActual; periodo = `año ${year}`; }
+            else if (/a[nñ]o\s+pasado/i.test(term)) { year = anioActual - 1; periodo = `año ${year}`; }
+            else {
+                const mY = term.match(/\b(20\d{2})\b/);
+                if (mY) { year = parseInt(mY[1], 10); periodo = `año ${year}`; }
+            }
+            if (/este\s+mes/i.test(term)) { month = new Date().getMonth() + 1; year = year || anioActual; periodo = `mes ${month}/${year}`; }
+            const mD = term.match(/(?:[uú]ltimos?|ultimos?)\s+(\d{1,3})\s+d[ií]as/i);
+            if (mD) { days = parseInt(mD[1], 10); periodo = `últimos ${days} días`; }
+            const idx = term.search(/(?:este\s+a[nñ]o|a[nñ]o\s+pasado|este\s+mes|(?:[uú]ltimos?|ultimos?)\s+\d{1,3}\s+d[ií]as|en\s+20\d{2}|20\d{2})/i);
+            if (idx > 0) term = term.slice(0, idx);
+            term = term.replace(/(?:\s+(?:de|del|en|durante|los|las|el|la))+\s*$/i, '').replace(/[?.!"'“”]+$/g, '').trim();
+
             if (term) {
+                let filtroPeriodo = '';
+                const paramsPeriodo = [];
+                if (year) { filtroPeriodo += ' AND YEAR(f.fecha_reg) = ?'; paramsPeriodo.push(year); }
+                if (month) { filtroPeriodo += ' AND MONTH(f.fecha_reg) = ?'; paramsPeriodo.push(month); }
+                if (days) { filtroPeriodo += ' AND f.fecha_reg >= DATE_SUB(CURDATE(), INTERVAL ? DAY)'; paramsPeriodo.push(days); }
+
                 const buscar = async (col, val) => {
                     const [r] = await pool.execute(
                         `SELECT c.id_cliente, c.nombres, c.celular,
@@ -1407,10 +1428,10 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                          FROM tab_facturas_reng r
                          JOIN tab_facturas f ON f.id_factura = r.id_factura
                          JOIN tab_clientes c ON c.id_cliente = f.id_cliente
-                         WHERE r.${col} = ? AND f.anulado = 'no'
+                         WHERE r.${col} = ? AND f.anulado = 'no'${filtroPeriodo}
                          GROUP BY c.id_cliente
                          ORDER BY unidades DESC, ultima DESC`,
-                        [val]
+                        [val, ...paramsPeriodo]
                     );
                     return r || [];
                 };
@@ -1427,16 +1448,16 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                          FROM tab_facturas_reng r
                          JOIN tab_facturas f ON f.id_factura = r.id_factura
                          JOIN tab_clientes c ON c.id_cliente = f.id_cliente
-                         WHERE r.producto LIKE ? AND f.anulado = 'no'
+                         WHERE r.producto LIKE ? AND f.anulado = 'no'${filtroPeriodo}
                          GROUP BY c.id_cliente
                          ORDER BY unidades DESC, ultima DESC
                          LIMIT 100`,
-                        [`%${term}%`]
+                        [`%${term}%`, ...paramsPeriodo]
                     ).catch(() => [[]]);
                     rows = rr || [];
                 }
                 if (!rows.length) {
-                    await safeSendMessage(from, { text: `🔎 No encontré ventas del producto "*${term}*" en facturas no anuladas.` });
+                    await safeSendMessage(from, { text: `🔎 No encontré ventas del producto "*${term}*"${periodo ? ' en ' + periodo : ''} en facturas no anuladas.` });
                     return true;
                 }
                 let desc = '';
@@ -1445,7 +1466,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     if (p && p[0]) desc = String(p[0].descripcion || '').slice(0, 90);
                 } catch (e) {}
                 const totalUnidades = rows.reduce((a, b) => a + Number(b.unidades || 0), 0);
-                let msg = `📦 *CLIENTES QUE COMPRARON ${term}*\n`;
+                let msg = `📦 *CLIENTES QUE COMPRARON ${term}${periodo ? ' — ' + periodo : ''}*\n`;
                 if (desc) msg += `_${desc}_\n`;
                 msg += `\n• Clientes: *${rows.length}*\n• Unidades vendidas: *${totalUnidades}*\n\n`;
                 rows.forEach((c, i) => {
