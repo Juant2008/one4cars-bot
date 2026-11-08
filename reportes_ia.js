@@ -177,6 +177,9 @@ Incluye la cifra principal y, si aporta, 2 o 3 detalles.`
     return respuesta || 'No pude redactar el reporte.';
   } catch (e) {
     console.log('[REPORTES-IA] Error:', e.message);
+    if (e.response && e.response.status === 402) {
+      return '⚠️ *La IA de reportes no tiene saldo en DeepSeek.*\n\nRecarga el saldo de DeepSeek para volver a usar las consultas con IA.\n\nMientras tanto puedes usar las consultas directas:\n• _qué clientes compraron el producto 510018 este año_\n• _estado de cuenta de DAVERFREN_\n• _cartera de MARTIN RAMIREZ_\n• _a dónde debería vender hoy_';
+    }
     return `No pude generar el reporte: ${e.message}`;
   }
 }

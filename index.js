@@ -1391,13 +1391,16 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
-        // 1w) ¿Qué clientes compraron el producto X?
-        const mCompra = t.match(/(?:qu[eé]|cu[aá]les|qui[eé]n(?:es)?)\s+(?:clientes?\s+)?(?:han?\s+)?(?:comprado|compraron|compr[oó])\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
+        // 1w) ¿Qué clientes compraron el producto X? / ventas del producto X
+        const mCompra = t.match(/(?:qu[eé]|cu[aá]les|qui[eé]n(?:es)?)\s+(?:clientes?\s+)?(?:han?\s+)?(?:comprado|compraron|compr[oó]|compt[oó])\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
             || t.match(/clientes?\s+que\s+(?:compraron|han\s+comprado)\s+(.+)/i)
-            || t.match(/(?:a\s+qui[eé]n(?:es)?\s+(?:le\s+)?(?:hemos?\s+)?vendido)\s+(.+)/i);
+            || t.match(/(?:a\s+qui[eé]n(?:es)?\s+(?:le\s+)?(?:hemos?\s+)?vendido)\s+(.+)/i)
+            || t.match(/(?:cu[aá]les\s+fueron\s+las\s+)?ventas?\s+(?:del?|de)\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
+            || t.match(/(?:qu[eé]\s+)?ventas?\s+(?:hubo|hay|se\s+hicieron)\s+(?:del?|de)\s+(?:producto\s+)?(.+)/i);
         if (mCompra) {
             let term = mCompra[1].replace(/[?.!"'“”]+$/g, '').replace(/^["'“”]+/, '').trim();
             const anioActual = new Date().getFullYear();
+            const MESES = { enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7, agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12 };
             let year = null, month = null, days = null, periodo = '';
             if (/este\s+a[nñ]o/i.test(term)) { year = anioActual; periodo = `año ${year}`; }
             else if (/a[nñ]o\s+pasado/i.test(term)) { year = anioActual - 1; periodo = `año ${year}`; }
@@ -1405,18 +1408,23 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                 const mY = term.match(/\b(20\d{2})\b/);
                 if (mY) { year = parseInt(mY[1], 10); periodo = `año ${year}`; }
             }
+            const mMesNum = term.match(/\bmes\s+(\d{1,2})\s*[\/\-]\s*(\d{4})/i) || term.match(/\b(\d{1,2})\/(\d{4})\b/);
+            if (mMesNum) { month = parseInt(mMesNum[1], 10); year = parseInt(mMesNum[2], 10); periodo = `mes ${month}/${year}`; }
+            const mMesNom = term.match(new RegExp(`\\b(${Object.keys(MESES).join('|')})\\s+(?:de\\s+)?(20\\d{2})`, 'i'));
+            if (mMesNom) { month = MESES[mMesNom[1].toLowerCase()]; year = parseInt(mMesNom[2], 10); periodo = `mes ${month}/${year}`; }
             if (/este\s+mes/i.test(term)) { month = new Date().getMonth() + 1; year = year || anioActual; periodo = `mes ${month}/${year}`; }
             const mD = term.match(/(?:[uú]ltimos?|ultimos?)\s+(\d{1,3})\s+d[ií]as/i);
             if (mD) { days = parseInt(mD[1], 10); periodo = `últimos ${days} días`; }
-            const idx = term.search(/(?:este\s+a[nñ]o|a[nñ]o\s+pasado|este\s+mes|(?:[uú]ltimos?|ultimos?)\s+\d{1,3}\s+d[ií]as|en\s+20\d{2}|20\d{2})/i);
-            if (idx > 0) term = term.slice(0, idx);
+            const rePeriodo = /(?:este\s+a[nñ]o|a[nñ]o\s+pasado|mes\s+\d{1,2}\s*[\/\-]\s*\d{4}|\d{1,2}\/\d{4}|\b(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b(?:\s+(?:de\s+)?20\d{2})?|este\s+mes|(?:[uú]ltimos?|ultimos?)\s+\d{1,3}\s+d[ií]as|en\s+20\d{2}|20\d{2})/gi;
+            term = term.replace(rePeriodo, ' ').replace(/\s+/g, ' ').trim();
             term = term.replace(/(?:\s+(?:de|del|en|durante|los|las|el|la))+\s*$/i, '').replace(/[?.!"'“”]+$/g, '').trim();
 
-            // Detectar zona al final: "... en boleita", "... en este boleita", "... zona catia"
+            // Detectar zona al final: "... en boleita", "... en el cementerio", "... zona catia"
             let zonaFiltro = null;
             const mZonaTerm = term.match(/\b(?:en|de|del|zona)\s+([a-záéíóúñü0-9\s]+)$/i);
             if (mZonaTerm) {
-                const cand = mZonaTerm[1].trim();
+                let cand = mZonaTerm[1].trim();
+                cand = cand.replace(/^(?:(?:el|la|los|las|en|de|del|zona)\s+)+/i, '').trim();
                 try {
                     const [zr] = await pool.execute("SELECT DISTINCT zona FROM tab_clientes WHERE zona LIKE ? LIMIT 1", [`%${cand}%`]);
                     if (zr && zr[0]) {
@@ -1797,8 +1805,9 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         if (/\btipo\b/i.test(t)) campos.push('tipo');
         if (/\b(datos|todo|informaci[oó]n)\b/i.test(t)) campos.push('todo');
         const empiezaCampo = /^\s*(?:el\s+|la\s+|los\s+|las\s+)?(?:tel[eé]fono|celular|rif|c[eé]dula|direcci[oó]n|vendedor|zona|tipo|datos|todo)\b/i.test(t);
-        const pideDatos = campos.length > 0 && (empiezaCampo ||
-            /(dame|dime|cu[aá]l|cu[aá]les|me das|necesito|busca|consulta|pido|quiero|sabes|tienes|ver)/i.test(t));
+        const verboDatos = /^\s*(?:dame|dime|me\s+das|cu[aá]l\s+es|cu[aá]les\s+son|necesito|busca|consulta|pido|quiero\s+saber|sabes|tienes|ver)\b/i.test(t);
+        const esAnalitica = /producto|ventas?|comprad|compt|factura|vendid|deuda|cartera/i.test(t);
+        const pideDatos = campos.length > 0 && (empiezaCampo || (verboDatos && !esAnalitica));
 
         if (pideDatos) {
             const mTerm = t.match(/(?:de|del|para)\s+([^?.!]+?)\s*$/i)
@@ -1808,6 +1817,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                 return true;
             }
             const term = mTerm[1].replace(/\s+(por favor|gracias)\.?$/i, '').replace(/[?.!]+$/g, '').trim();
+            if (/producto|ventas?|comprad|compt|factura|vendid/i.test(term)) return false;
             const clientes = await buscarClientesPorNombre(term);
             if (!clientes.length) {
                 await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
