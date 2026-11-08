@@ -1391,6 +1391,74 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
+        // 1w) ¿Qué clientes compraron el producto X?
+        const mCompra = t.match(/(?:qu[eé]|cu[aá]les|qui[eé]n(?:es)?)\s+(?:clientes?\s+)?(?:han?\s+)?(?:comprado|compraron|compr[oó])\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
+            || t.match(/clientes?\s+que\s+(?:compraron|han\s+comprado)\s+(.+)/i)
+            || t.match(/(?:a\s+qui[eé]n(?:es)?\s+(?:le\s+)?(?:hemos?\s+)?vendido)\s+(.+)/i);
+        if (mCompra) {
+            const term = mCompra[1].replace(/[?.!"'“”]+$/g, '').replace(/^["'“”]+/, '').trim();
+            if (term) {
+                const buscar = async (col, val) => {
+                    const [r] = await pool.execute(
+                        `SELECT c.id_cliente, c.nombres, c.celular,
+                                COUNT(DISTINCT f.id_factura) facturas,
+                                SUM(r.cantidad) unidades,
+                                MAX(f.fecha_reg) ultima
+                         FROM tab_facturas_reng r
+                         JOIN tab_facturas f ON f.id_factura = r.id_factura
+                         JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                         WHERE r.${col} = ? AND f.anulado = 'no'
+                         GROUP BY c.id_cliente
+                         ORDER BY unidades DESC, ultima DESC`,
+                        [val]
+                    );
+                    return r || [];
+                };
+                let rows = await buscar('producto', term);
+                if (!rows.length && /^\d+$/.test(term)) {
+                    rows = await buscar('id_producto', parseInt(term, 10));
+                }
+                if (!rows.length) {
+                    const [rr] = await pool.execute(
+                        `SELECT c.id_cliente, c.nombres, c.celular,
+                                COUNT(DISTINCT f.id_factura) facturas,
+                                SUM(r.cantidad) unidades,
+                                MAX(f.fecha_reg) ultima
+                         FROM tab_facturas_reng r
+                         JOIN tab_facturas f ON f.id_factura = r.id_factura
+                         JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                         WHERE r.producto LIKE ? AND f.anulado = 'no'
+                         GROUP BY c.id_cliente
+                         ORDER BY unidades DESC, ultima DESC
+                         LIMIT 100`,
+                        [`%${term}%`]
+                    ).catch(() => [[]]);
+                    rows = rr || [];
+                }
+                if (!rows.length) {
+                    await safeSendMessage(from, { text: `🔎 No encontré ventas del producto "*${term}*" en facturas no anuladas.` });
+                    return true;
+                }
+                let desc = '';
+                try {
+                    const [p] = await pool.execute("SELECT descripcion FROM tab_productos WHERE producto = ? LIMIT 1", [term]);
+                    if (p && p[0]) desc = String(p[0].descripcion || '').slice(0, 90);
+                } catch (e) {}
+                const totalUnidades = rows.reduce((a, b) => a + Number(b.unidades || 0), 0);
+                let msg = `📦 *CLIENTES QUE COMPRARON ${term}*\n`;
+                if (desc) msg += `_${desc}_\n`;
+                msg += `\n• Clientes: *${rows.length}*\n• Unidades vendidas: *${totalUnidades}*\n\n`;
+                rows.forEach((c, i) => {
+                    const ult = c.ultima ? new Date(c.ultima).toLocaleDateString('es-VE') : '—';
+                    msg += `${i + 1}. *${c.nombres}* — ${c.unidades} und · ${c.facturas} fact. · últ. ${ult}`;
+                    if (c.celular) msg += ` · 📞 ${String(c.celular).trim()}`;
+                    msg += `\n`;
+                });
+                await enviarTexto(from, msg.trim());
+                return true;
+            }
+        }
+
         // 1x) Acciones naturales (envíos y ajustes, no consultas)
         if (await acciones.manejar(from, t)) return true;
 

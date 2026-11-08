@@ -135,6 +135,8 @@ REGLAS:
 - Saldo de una factura = (total - abono_factura). NO dividir por porcentaje. total ya está en USD.
 - Facturas pendientes: pagada = 'NO' AND anulado = 'no'. Facturas vencidas: además fecha_reg <= DATE_SUB(CURDATE(), INTERVAL 30 DAY).
 - Clientes: tab_clientes (nombres, celular, clave = RIF sin letra, cedula = RIF con letra, vendedor, tipo, zona, activo).
+- Ventas por producto: tab_facturas_reng (id_factura, producto = CÓDIGO del producto, id_producto = ID numérico interno, cantidad, precio_unitario, precio_total). Para "clientes que compraron el producto X" usa r.producto = 'X' (NO uses id_producto con el código). Une r.id_factura = f.id_factura, f.id_cliente = c.id_cliente y filtra f.anulado = 'no'.
+- Productos: tab_productos.producto es el código; tab_productos.descripcion el nombre; tab_productos.id_producto el ID interno.
 - Pedidos: tab_pedidos y tab_pedidos_reng.
 - Visitas: tab_agenda_visitas.
 - Leads mayoristas: bot_leads.
