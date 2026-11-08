@@ -1427,14 +1427,19 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             }
 
             if (term) {
-                let filtroPeriodo = '';
-                const paramsPeriodo = [];
-                if (year) { filtroPeriodo += ' AND YEAR(f.fecha_reg) = ?'; paramsPeriodo.push(year); }
-                if (month) { filtroPeriodo += ' AND MONTH(f.fecha_reg) = ?'; paramsPeriodo.push(month); }
-                if (days) { filtroPeriodo += ' AND f.fecha_reg >= DATE_SUB(CURDATE(), INTERVAL ? DAY)'; paramsPeriodo.push(days); }
-                if (zonaFiltro) { filtroPeriodo += ' AND c.zona = ?'; paramsPeriodo.push(zonaFiltro); }
-
-                const buscar = async (col, val) => {
+                const construirFiltro = (conPeriodo) => {
+                    let f = '';
+                    const p = [];
+                    if (conPeriodo) {
+                        if (year) { f += ' AND YEAR(f.fecha_reg) = ?'; p.push(year); }
+                        if (month) { f += ' AND MONTH(f.fecha_reg) = ?'; p.push(month); }
+                        if (days) { f += ' AND f.fecha_reg >= DATE_SUB(CURDATE(), INTERVAL ? DAY)'; p.push(days); }
+                    }
+                    if (zonaFiltro) { f += ' AND c.zona = ?'; p.push(zonaFiltro); }
+                    return { f, p };
+                };
+                const buscar = async (col, val, conPeriodo = true) => {
+                    const { f, p } = construirFiltro(conPeriodo);
                     const [r] = await pool.execute(
                         `SELECT c.id_cliente, c.nombres, c.celular,
                                 COUNT(DISTINCT f.id_factura) facturas,
@@ -1443,10 +1448,10 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                          FROM tab_facturas_reng r
                          JOIN tab_facturas f ON f.id_factura = r.id_factura
                          JOIN tab_clientes c ON c.id_cliente = f.id_cliente
-                         WHERE r.${col} = ? AND f.anulado = 'no'${filtroPeriodo}
+                         WHERE r.${col} = ? AND f.anulado = 'no'${f}
                          GROUP BY c.id_cliente
                          ORDER BY unidades DESC, ultima DESC`,
-                        [val, ...paramsPeriodo]
+                        [val, ...p]
                     );
                     return r || [];
                 };
@@ -1455,6 +1460,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     rows = await buscar('id_producto', parseInt(term, 10));
                 }
                 if (!rows.length) {
+                    const cf = construirFiltro(true);
                     const [rr] = await pool.execute(
                         `SELECT c.id_cliente, c.nombres, c.celular,
                                 COUNT(DISTINCT f.id_factura) facturas,
@@ -1463,15 +1469,72 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                          FROM tab_facturas_reng r
                          JOIN tab_facturas f ON f.id_factura = r.id_factura
                          JOIN tab_clientes c ON c.id_cliente = f.id_cliente
-                         WHERE r.producto LIKE ? AND f.anulado = 'no'${filtroPeriodo}
+                         WHERE r.producto LIKE ? AND f.anulado = 'no'${cf.f}
                          GROUP BY c.id_cliente
                          ORDER BY unidades DESC, ultima DESC
                          LIMIT 100`,
-                        [`%${term}%`, ...paramsPeriodo]
+                        [`%${term}%`, ...cf.p]
                     ).catch(() => [[]]);
                     rows = rr || [];
                 }
+                if (!rows.length && (year || month || days)) {
+                    const previas = await buscar('producto', term, false);
+                    if (previas.length) {
+                        let m2 = `🔎 No hay ventas de *${term}* en ${periodo}${zonaFiltro ? ' en ' + zonaFiltro : ''}.\n\n*Últimas ventas registradas (fuera de ese período):*\n`;
+                        previas.slice(0, 12).forEach((c, i) => {
+                            const ult = c.ultima ? new Date(c.ultima).toLocaleDateString('es-VE') : '—';
+                            m2 += `${i + 1}. ${c.nombres} — ${c.unidades} und · últ. ${ult}\n`;
+                        });
+                        if (previas.length > 12) m2 += `… y ${previas.length - 12} más. Pregunta sin período para ver todos.\n`;
+                        if (/^\d{4,}$/.test(term)) {
+                            try {
+                                const cf = construirFiltro(true);
+                                const pref = term.slice(0, Math.max(4, term.length - 2));
+                                const [sim] = await pool.execute(
+                                    `SELECT r.producto, LEFT(p.descripcion, 70) AS descripcion, SUM(r.cantidad) u
+                                     FROM tab_facturas_reng r
+                                     JOIN tab_facturas f ON f.id_factura = r.id_factura
+                                     JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                                     LEFT JOIN tab_productos p ON p.producto = r.producto
+                                     WHERE r.producto LIKE ? AND r.producto <> ? AND f.anulado = 'no'${cf.f}
+                                     GROUP BY r.producto ORDER BY u DESC LIMIT 6`,
+                                    [`${pref}%`, term, ...cf.p]
+                                );
+                                if (sim && sim.length) {
+                                    m2 += `\n*Códigos parecidos vendidos en ${periodo}${zonaFiltro ? ' en ' + zonaFiltro : ''}:*\n`;
+                                    sim.forEach(s => { m2 += `• *${s.producto}* — ${s.u} und${s.descripcion ? ' · ' + s.descripcion : ''}\n`; });
+                                }
+                            } catch (e) {}
+                        }
+                        await enviarTexto(from, m2.trim());
+                        return true;
+                    }
+                }
                 if (!rows.length) {
+                    if (/^\d{4,}$/.test(term)) {
+                        try {
+                            const cf = construirFiltro(true);
+                            const pref = term.slice(0, Math.max(4, term.length - 2));
+                            const [sim] = await pool.execute(
+                                `SELECT r.producto, LEFT(p.descripcion, 70) AS descripcion, SUM(r.cantidad) u
+                                 FROM tab_facturas_reng r
+                                 JOIN tab_facturas f ON f.id_factura = r.id_factura
+                                 JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                                 LEFT JOIN tab_productos p ON p.producto = r.producto
+                                 WHERE r.producto LIKE ? AND r.producto <> ? AND f.anulado = 'no'${cf.f}
+                                 GROUP BY r.producto
+                                 ORDER BY u DESC LIMIT 6`,
+                                [`${pref}%`, term, ...cf.p]
+                            );
+                            if (sim && sim.length) {
+                                let m3 = `🔎 No hay ventas de *${term}*${periodo ? ' en ' + periodo : ''}${zonaFiltro ? ' en ' + zonaFiltro : ''}.\n\n*Códigos parecidos que sí se vendieron:*\n`;
+                                sim.forEach(s => { m3 += `• *${s.producto}* — ${s.u} und${s.descripcion ? ' · ' + s.descripcion : ''}\n`; });
+                                m3 += `\nVerifica si el código es uno de esos.`;
+                                await enviarTexto(from, m3);
+                                return true;
+                            }
+                        } catch (e) {}
+                    }
                     await safeSendMessage(from, { text: `🔎 No encontré ventas del producto "*${term}*"${periodo ? ' en ' + periodo : ''}${zonaFiltro ? ' en la zona ' + zonaFiltro : ''} en facturas no anuladas.` });
                     return true;
                 }
