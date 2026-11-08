@@ -1412,12 +1412,27 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             if (idx > 0) term = term.slice(0, idx);
             term = term.replace(/(?:\s+(?:de|del|en|durante|los|las|el|la))+\s*$/i, '').replace(/[?.!"'“”]+$/g, '').trim();
 
+            // Detectar zona al final: "... en boleita", "... en este boleita", "... zona catia"
+            let zonaFiltro = null;
+            const mZonaTerm = term.match(/\b(?:en|de|del|zona)\s+([a-záéíóúñü0-9\s]+)$/i);
+            if (mZonaTerm) {
+                const cand = mZonaTerm[1].trim();
+                try {
+                    const [zr] = await pool.execute("SELECT DISTINCT zona FROM tab_clientes WHERE zona LIKE ? LIMIT 1", [`%${cand}%`]);
+                    if (zr && zr[0]) {
+                        zonaFiltro = zr[0].zona;
+                        term = term.slice(0, mZonaTerm.index).replace(/(?:\s+(?:de|del|en|zona))+\s*$/i, '').trim();
+                    }
+                } catch (e) {}
+            }
+
             if (term) {
                 let filtroPeriodo = '';
                 const paramsPeriodo = [];
                 if (year) { filtroPeriodo += ' AND YEAR(f.fecha_reg) = ?'; paramsPeriodo.push(year); }
                 if (month) { filtroPeriodo += ' AND MONTH(f.fecha_reg) = ?'; paramsPeriodo.push(month); }
                 if (days) { filtroPeriodo += ' AND f.fecha_reg >= DATE_SUB(CURDATE(), INTERVAL ? DAY)'; paramsPeriodo.push(days); }
+                if (zonaFiltro) { filtroPeriodo += ' AND c.zona = ?'; paramsPeriodo.push(zonaFiltro); }
 
                 const buscar = async (col, val) => {
                     const [r] = await pool.execute(
@@ -1457,7 +1472,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     rows = rr || [];
                 }
                 if (!rows.length) {
-                    await safeSendMessage(from, { text: `🔎 No encontré ventas del producto "*${term}*"${periodo ? ' en ' + periodo : ''} en facturas no anuladas.` });
+                    await safeSendMessage(from, { text: `🔎 No encontré ventas del producto "*${term}*"${periodo ? ' en ' + periodo : ''}${zonaFiltro ? ' en la zona ' + zonaFiltro : ''} en facturas no anuladas.` });
                     return true;
                 }
                 let desc = '';
@@ -1466,7 +1481,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     if (p && p[0]) desc = String(p[0].descripcion || '').slice(0, 90);
                 } catch (e) {}
                 const totalUnidades = rows.reduce((a, b) => a + Number(b.unidades || 0), 0);
-                let msg = `📦 *CLIENTES QUE COMPRARON ${term}${periodo ? ' — ' + periodo : ''}*\n`;
+                let msg = `📦 *CLIENTES QUE COMPRARON ${term}${periodo ? ' — ' + periodo : ''}${zonaFiltro ? ' · ' + zonaFiltro : ''}*\n`;
                 if (desc) msg += `_${desc}_\n`;
                 msg += `\n• Clientes: *${rows.length}*\n• Unidades vendidas: *${totalUnidades}*\n\n`;
                 rows.forEach((c, i) => {
