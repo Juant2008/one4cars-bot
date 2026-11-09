@@ -254,7 +254,17 @@ const BOT_VERSION = '2026-11-07.1-rodi-ai'; // Visible en /ping para confirmar q
 const PDF_URL_CATALOGO = process.env.PDF_URL_CATALOGO || 'https://www.one4cars.com/catalogo.pdf';
 
 // LISTA DE ADMINISTRADORES
-const ADMIN_IDS = ["228621243408492", "97899534934200", "584123715550"];   
+const ADMIN_IDS = ["228621243408492", "97899534934200", "584123715550", "584142531553"];
+
+// Normaliza un número para comparar (580414... → 58414..., 0414... → 58414...)
+function normalizarTelAdmin(v) {
+    let d = String(v || '').replace(/\D/g, '');
+    if (!d) return '';
+    if (d.startsWith('580')) d = '58' + d.slice(3);
+    if (d.startsWith('0')) d = '58' + d.slice(1);
+    if (!d.startsWith('58') && d.length === 10) d = '58' + d;
+    return d;
+}   
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'one4cars.com',
     user: process.env.DB_USER || 'juant200_one4car',
@@ -3941,7 +3951,12 @@ async function startBot() {
                 }
             }
 
-            const isAdmin = ADMIN_IDS.some(id => from.includes(id) || String((msg.key && (msg.key.senderPn || msg.key.remoteJidAlt)) || '').includes(id));
+            const isAdmin = ADMIN_IDS.some(id => {
+                const n = normalizarTelAdmin(id);
+                const fromDig = String(from || '').replace(/\D/g, '');
+                const pnDig = String((msg.key && (msg.key.senderPn || msg.key.remoteJidAlt)) || '').replace(/\D/g, '');
+                return String(from || '').includes(id) || fromDig.includes(n) || pnDig.includes(n);
+            });
             const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
 
             if (!licencia.estaActiva() && !isAdmin) {
