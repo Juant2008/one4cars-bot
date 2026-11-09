@@ -1566,6 +1566,94 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             }
         }
 
+        // 1v) Record de pago / comportamiento de un cliente
+        const mRecord = t.match(/(?:record|historial|comportamiento|conducta)\s+(?:de\s+)?pago\s+(?:de|del)\s+(.+)/i)
+            || t.match(/(?:c[oó]mo\s+paga|qu[eé]\s+tal\s+paga|c[oó]mo\s+se\s+comporta|c[oó]mo\s+es\s+(?:el\s+)?(?:cliente|pago))\s+(?:a|al|de|del)?\s*(.+)/i)
+            || t.match(/(?:status|estatus)\s+(?:de|del)\s+(.+)/i);
+        if (mRecord) {
+            const term = mRecord[1].replace(/[?.!]+$/g, '').trim();
+            const clientes = await buscarClientesPorNombre(term);
+            if (!clientes.length) {
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                return true;
+            }
+            const c = clientes[0];
+            const [facturas] = await pool.execute(
+                `SELECT nro_factura, fecha_reg, dias_pago, dias_credito, total, abono_factura, porcentaje, pagada
+                 FROM tab_facturas
+                 WHERE id_cliente = ? AND anulado = 'no'
+                 ORDER BY fecha_reg DESC LIMIT 200`,
+                [c.id_cliente]
+            );
+            const pagadas = (facturas || []).filter(f => String(f.pagada || '').toUpperCase() === 'SI');
+            const pendientes = (facturas || []).filter(f => String(f.pagada || '').toUpperCase() !== 'SI');
+            const conDias = pagadas.filter(f => f.dias_pago !== null && f.dias_pago !== undefined);
+            const saldoPend = pendientes.reduce((a, f) => a + Math.max(0, parseFloat(f.total || 0) - parseFloat(f.abono_factura || 0)), 0);
+
+            const puntosDias = (d) => {
+                if (d <= 7) return 100;
+                if (d <= 15) return 88;
+                if (d <= 30) return 72;
+                if (d <= 45) return 55;
+                if (d <= 60) return 38;
+                if (d <= 90) return 22;
+                return 10;
+            };
+            let msg = `📈 *RECORD DE PAGO*\n\n👤 *${c.nombres}*\n🆔 RIF: ${formatoRif(c)}\n🧑‍💼 Vendedor: ${c.vendedor || '—'}\n🏷️ Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
+            const estRaw = String(c.status || c.activo || '').trim().toUpperCase();
+            const estTxt = ['SI', 'A', 'ACTIVO'].includes(estRaw) ? 'ACTIVO' : (['NO', 'N', 'INACTIVO'].includes(estRaw) ? 'INACTIVO' : (estRaw || '—'));
+            msg += `📌 Estado: ${estTxt}\n`;
+
+            if (!conDias.length) {
+                msg += `\nSin facturas pagadas con registro de días de pago.\n`;
+                if (pendientes.length) msg += `\n⏳ Facturas pendientes: *${pendientes.length}* por *$${formatoBs(saldoPend)}*`;
+                await enviarTexto(from, msg.trim());
+                return true;
+            }
+
+            let sumaPesos = 0, sumaPuntos = 0, sumaDias = 0, maxDias = 0, aTiempo = 0, totalPagado = 0;
+            for (const f of conDias) {
+                const d = Number(f.dias_pago);
+                const monto = Math.max(0, parseFloat(f.total || 0));
+                const peso = Math.min(monto, 2000) || 1;
+                sumaPesos += peso;
+                sumaPuntos += puntosDias(d) * peso;
+                sumaDias += d;
+                if (d > maxDias) maxDias = d;
+                if (d <= 30) aTiempo++;
+                totalPagado += monto;
+            }
+            const score = Math.round(sumaPuntos / (sumaPesos || 1));
+            const promedio = (sumaDias / conDias.length).toFixed(1);
+            const pctATiempo = Math.round((aTiempo / conDias.length) * 100);
+            let etiqueta = 'MALO 🔴';
+            if (score >= 90) etiqueta = 'EXCEPCIONAL ⭐⭐⭐';
+            else if (score >= 78) etiqueta = 'BUENO ✅';
+            else if (score >= 64) etiqueta = 'REGULAR ⚠️';
+            else if (score >= 48) etiqueta = 'IRREGULAR 🔶';
+
+            msg += `\n*Resumen de pago*\n`;
+            msg += `• Facturas pagadas: *${pagadas.length}*\n`;
+            msg += `• Con registro de días: *${conDias.length}*\n`;
+            msg += `• Promedio de pago: *${promedio} días*\n`;
+            msg += `• Pagadas a tiempo (≤30 días): *${pctATiempo}%*\n`;
+            msg += `• Máxima demora: *${maxDias} días*\n`;
+            msg += `• Total pagado: *$${formatoBs(totalPagado)}*\n`;
+            msg += `\n🏆 *Calificación: ${etiqueta}* (score ${score}/100)\n`;
+
+            msg += `\n*Últimas facturas pagadas:*\n`;
+            conDias.slice(0, 12).forEach((f, i) => {
+                const fecha = new Date(f.fecha_reg).toLocaleDateString('es-VE');
+                const emoji = Number(f.dias_pago) <= 15 ? '🟢' : (Number(f.dias_pago) <= 30 ? '🟡' : (Number(f.dias_pago) <= 60 ? '🟠' : '🔴'));
+                msg += `${i + 1}. #${f.nro_factura} · ${fecha} · ${emoji} *${f.dias_pago}d* · $${formatoBs(parseFloat(f.total || 0))}\n`;
+            });
+            if (pendientes.length) {
+                msg += `\n⏳ *Pendientes:* ${pendientes.length} por *$${formatoBs(saldoPend)}*`;
+            }
+            await enviarTexto(from, msg.trim());
+            return true;
+        }
+
         // 1x) Acciones naturales (envíos y ajustes, no consultas)
         if (await acciones.manejar(from, t)) return true;
 
