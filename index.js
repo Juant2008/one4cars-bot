@@ -1420,6 +1420,61 @@ Usuario: one4cars
 _Escribe solo la palabra *comandos* cuando necesites este menú._`;
 }
 
+async function enviarEstadoCuentaCliente(from, term) {
+    const clientes = await buscarClientesPorNombre(term);
+    if (!clientes.length) {
+        const vend = await buscarVendedorPorNombre(term);
+        if (vend) {
+            const resumen = await resumenCarteraVendedor(vend.id_vendedor);
+            let mv = `📊 *CARTERA DEL VENDEDOR*\n\n🧑‍💼 *${vend.nombre}*\n`;
+            if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
+            mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
+            if (resumen.detalle.length) {
+                mv += `\n*Clientes con saldo (${resumen.detalle.length}):*\n`;
+                resumen.detalle.forEach((c, i) => { mv += `${i + 1}. ${c.nombres} — *$${formatoBs(c.saldo)}* (${c.dias}d)\n`; });
+            }
+            await enviarTexto(from, mv.trim());
+            return true;
+        }
+        await safeSendMessage(from, { text: `❌ No encontré un cliente ni un vendedor que coincida con "*${term}*".` });
+        return true;
+    }
+    const c = clientes[0];
+    if (String(c.tipo || '').toUpperCase() === 'VENDEDOR') {
+        const vend = await buscarVendedorPorNombre(c.nombres);
+        if (vend) {
+            const resumen = await resumenCarteraVendedor(vend.id_vendedor);
+            let mv = `📊 *CARTERA DEL VENDEDOR*\n\n🧑‍💼 *${vend.nombre}*\n`;
+            if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
+            mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
+            if (resumen.detalle.length) {
+                mv += `\n*Clientes con saldo (${resumen.detalle.length}):*\n`;
+                resumen.detalle.forEach((d, i) => { mv += `${i + 1}. ${d.nombres} — *$${formatoBs(d.saldo)}* (${d.dias}d)\n`; });
+            }
+            await enviarTexto(from, mv.trim());
+            return true;
+        }
+    }
+    const facturas = await facturasPendientesCliente(c.id_cliente);
+    let msg = `📊 *ESTADO DE CUENTA*\n\n👤 *${c.nombres}*\n🆔 RIF: ${formatoRif(c)}\n🧑‍💼 Vendedor: ${c.vendedor || '—'}\n🏷️ Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
+    if (!facturas.length) {
+        msg += `\n✅ Sin facturas pendientes. Cuenta al día.`;
+    } else {
+        let total = 0, vencido = 0;
+        msg += `\n*Facturas pendientes (${facturas.length}):*\n`;
+        facturas.forEach((f, i) => {
+            const saldo = Math.max(0, parseFloat(f.total) - parseFloat(f.abono_factura || 0));
+            total += saldo;
+            if (Number(f.dias) >= 30) vencido += saldo;
+            const etiqueta = Number(f.dias) >= 30 ? '🔴 VENCIDA' : '🧾 NO vencida';
+            msg += `\n*${i + 1}. #${f.nro_factura}* · ${new Date(f.fecha_reg).toISOString().split('T')[0]} · ${f.dias}d · ${etiqueta} · *$${formatoBs(saldo)}*\n✍️ https://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg\n`;
+        });
+        msg += `\n💰 *Total pendiente: $${formatoBs(total)}* (vencido: $${formatoBs(vencido)})`;
+    }
+    await enviarTexto(from, msg.trim());
+    return true;
+}
+
 /** Procesa consultas rápidas del dueño. Devuelve true si ya respondió. */
 async function atenderConsultaDueno(from, rawText, isAdmin) {
     const t = String(rawText || '').trim();
@@ -1850,64 +1905,13 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
 
         // 2b) Estado de cuenta de un cliente (con facturas firmadas)
-        const mEc = t.match(/estado de cuenta\s+(?:de|del|para)\s+(.+)/i);
+        const mEc = t.match(/estado de cuenta\s+(?:de|del|para)?\s*(.+)/i);
         if (mEc) {
             const term = mEc[1].replace(/[?.!]+$/g, '').trim();
-            const clientes = await buscarClientesPorNombre(term);
-            if (!clientes.length) {
-                // ¿Será un vendedor? Mostrar su cartera.
-                const vend = await buscarVendedorPorNombre(term);
-                if (vend) {
-                    const resumen = await resumenCarteraVendedor(vend.id_vendedor);
-                    let mv = `📊 *CARTERA DEL VENDEDOR*\n\n🧑‍💼 *${vend.nombre}*\n`;
-                    if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
-                    mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
-                    if (resumen.detalle.length) {
-                        mv += `\n*Clientes con saldo (${resumen.detalle.length}):*\n`;
-                        resumen.detalle.forEach((c, i) => {
-                            mv += `${i + 1}. ${c.nombres} — *$${formatoBs(c.saldo)}* (${c.dias}d)\n`;
-                        });
-                    }
-                    await enviarTexto(from, mv.trim());
-                    return true;
-                }
-                await safeSendMessage(from, { text: `❌ No encontré un cliente ni un vendedor que coincida con "*${term}*".` });
+            if (term) {
+                await enviarEstadoCuentaCliente(from, term);
                 return true;
             }
-            const c = clientes[0];
-            if (String(c.tipo || '').toUpperCase() === 'VENDEDOR') {
-                const vend = await buscarVendedorPorNombre(c.nombres);
-                if (vend) {
-                    const resumen = await resumenCarteraVendedor(vend.id_vendedor);
-                    let mv = `📊 *CARTERA DEL VENDEDOR*\n\n🧑‍💼 *${vend.nombre}*\n`;
-                    if (vend.celular_vendedor) mv += `📞 ${vend.celular_vendedor}\n`;
-                    mv += `\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
-                    if (resumen.detalle.length) {
-                        mv += `\n*Clientes con saldo (${resumen.detalle.length}):*\n`;
-                        resumen.detalle.forEach((d, i) => {
-                            mv += `${i + 1}. ${d.nombres} — *$${formatoBs(d.saldo)}* (${d.dias}d)\n`;
-                        });
-                    }
-                    await enviarTexto(from, mv.trim());
-                    return true;
-                }
-            }
-            const facturas = await facturasPendientesCliente(c.id_cliente);
-            let msg = `📊 *ESTADO DE CUENTA*\n\n👤 *${c.nombres}*\n🆔 RIF: ${formatoRif(c)}\n🧑‍💼 Vendedor: ${c.vendedor || '—'}\n🏷️ Tipo: ${c.tipo || '—'}${c.cliente_oficina === 'SI' ? ' · OFICINA' : ''}\n`;
-            if (!facturas.length) {
-                msg += `\n✅ Sin facturas pendientes. Cuenta al día.`;
-            } else {
-                let total = 0;
-                msg += `\n*Facturas pendientes (${facturas.length}):*\n`;
-                facturas.forEach((f, i) => {
-                    const saldo = Math.max(0, parseFloat(f.total) - parseFloat(f.abono_factura || 0));
-                    total += saldo;
-                    msg += `\n*${i + 1}. #${f.nro_factura}* · ${new Date(f.fecha_reg).toISOString().split('T')[0]} · ${f.dias}d · *$${formatoBs(saldo)}*\n✍️ https://www.one4cars.com/uploads/notas/${f.nro_factura}.jpg\n`;
-                });
-                msg += `\n💰 *Total pendiente: $${formatoBs(total)}*`;
-            }
-            await enviarTexto(from, msg.trim());
-            return true;
         }
 
         // 2c) ¿Qué tipo de cliente es X?
@@ -3259,13 +3263,22 @@ async function ejecutarAccionRouter(decision, ctx) {
             return await responderRouter(from, texto || accion.respuesta || '');
         case 'estado_cuenta': {
             const rif = String((decision.parametros && decision.parametros.rif) || '').trim();
+            const clienteParam = String((decision.parametros && (decision.parametros.cliente || decision.parametros.nombre)) || '').trim();
             if (rif) {
                 pendienteFactura.set(from, { paso: 'rif' });
                 const manejado = await procesarRIFConsulta(from, rif, normalizar(rif));
                 if (manejado) return true;
             }
+            let termBusqueda = clienteParam || String(ctx.rawText || '')
+                .replace(/^(hola|buenas|buenos d[ií]as|estimado|por favor|dame|dime|cons[uú]ltame|consulta|mu[eé]strame|ver)\b[,\s]*/gi, '')
+                .replace(/^(el\s+)?estado\s+de\s+cuenta\s*(de|del|para)?\s*/gi, '')
+                .trim();
+            if (termBusqueda && termBusqueda.length >= 3 && !/^(sigue|ok|dale|por favor)$/i.test(termBusqueda)) {
+                await enviarEstadoCuentaCliente(from, termBusqueda);
+                return true;
+            }
             pendienteFactura.set(from, { paso: 'rif' });
-            return await responderRouter(from, texto || accion.respuesta || '');
+            return await responderRouter(from, 'Indíqueme el cliente (nombre o RIF). Ejemplo: *estado de cuenta de daverfren*');
         }
         case 'producto':
             return await responderProductosIA(from, (decision.parametros && decision.parametros.busqueda) || ctx.rawText);
