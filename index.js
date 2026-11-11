@@ -1475,6 +1475,41 @@ async function enviarEstadoCuentaCliente(from, term) {
     return true;
 }
 
+/** Saludo breve y humano para el primer contacto (sin volcar el menú). */
+function saludoPorHoraCaracas() {
+    const h = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/Caracas', hour: '2-digit', hour12: false }), 10);
+    if (h < 12) return 'Buenos días';
+    if (h < 19) return 'Buenas tardes';
+    return 'Buenas noches';
+}
+
+function primerNombre(nombre) {
+    const n = String(nombre || '').trim().split(/\s+/)[0] || '';
+    if (!n) return '';
+    return n.charAt(0).toUpperCase() + n.slice(1).toLowerCase();
+}
+
+async function enviarSaludoHumano(jid, nombre) {
+    const n = primerNombre(nombre);
+    const saludo = saludoPorHoraCaracas();
+    const variantes = n
+        ? [
+            `¡Hola, ${n}! 👋 ${saludo}. ¿Cómo te ha ido?`,
+            `¡Hola, ${n}! 😊 ${saludo}. ¿Cómo estás?`,
+            `Hola, ${n}. 👋 ${saludo}. ¿Cómo te va?`
+        ]
+        : [
+            `¡Hola! 👋 ${saludo}. ¿Cómo te ha ido?`,
+            `¡Hola! 😊 ${saludo}. ¿Cómo estás?`
+        ];
+    const texto = variantes[Math.floor(Math.random() * variantes.length)];
+    const espera = 4000 + Math.floor(Math.random() * 2500);
+    try { if (socketBot && isBotReady()) await socketBot.sendPresenceUpdate('composing', jid); } catch (e) {}
+    await new Promise(r => setTimeout(r, espera));
+    try { if (socketBot && isBotReady()) await socketBot.sendPresenceUpdate('paused', jid); } catch (e) {}
+    await safeSendMessage(jid, { text: texto });
+}
+
 /** Procesa consultas rápidas del dueño. Devuelve true si ya respondió. */
 async function atenderConsultaDueno(from, rawText, isAdmin) {
     const t = String(rawText || '').trim();
@@ -4518,9 +4553,21 @@ async function startBot() {
                     return;
                 }
 
-                const msg = `👋 *Bienvenido a ONE4CARS, ${pushName}.*\n\nSoy *RODI*, su asistente virtual, con respaldo de nuestro equipo de especialistas. Podemos asistirle con medios de pago, estado de cuenta, precios, pedidos, consulta de productos y seguimiento de despachos.\n\n¿En qué puedo servirle hoy? _Escriba *Menú* para ver todas las opciones._`;
-                await safeSendMessage(from, { text: msg });
-                return;
+                // Primer contacto:
+                // - Si es solo un saludo, responder breve y humano (con pausa y "escribiendo").
+                // - Si trae una consulta real, NO volcar la bienvenida: dejar que el flujo normal responda.
+                const textoLimpio = rawText.trim();
+                const esSoloSaludo = /^(hola|buenas|buenos\s+d[ií]as|buen\s+d[ií]a|buenas\s+tardes|buenas\s+noches|hello|hi|saludos?|que\s+tal|qu[eé]\s+tal)\b[!.,\s]*$/i.test(textoLimpio);
+                if (esSoloSaludo) {
+                    if (isAdmin) {
+                        await safeSendMessage(from, { text: '👋 Hola. Escribe *comandos* para ver el menú del gerente.' });
+                        return;
+                    }
+                    await enviarSaludoHumano(from, nombreExtraido || pushName);
+                    return;
+                }
+                // Consulta real en el primer mensaje: continuar sin mensaje de bienvenida.
+                // (El flujo normal de abajo la atiende.)
             }
 
             const esSaludo = text === 'menu' || text.startsWith('menu ') ||
@@ -6789,6 +6836,16 @@ const server = http.createServer(async (req, res) => {
             licencia: licencia.estado(),
             hora: new Date().toISOString()
         }));
+    } else if (routename === '/test-saludo') {
+        try {
+            const nombre = query.nombre || 'Cliente';
+            await enviarSaludoHumano(formatWhatsApp(query.to || '584123715550'), nombre);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, nombre }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
     } else if (routename === '/test-menu') {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true, menu: menuGerente() }, null, 2));
