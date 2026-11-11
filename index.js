@@ -745,26 +745,83 @@ async function safeSendMessage(jid, content) {
     }
 }
 
+// ===== HUMANIZACIÓN =====
+const ultimosSaludos = new Map();     // jid -> timestamp del último saludo
+const ultimoAvisoCerrado = new Map(); // jid -> timestamp del último aviso de cerrado
+const ultimaPregunta = new Map();     // jid -> { texto, ts }
+
+function jidEsAdmin(jid) {
+    const d = String(jid || '').replace(/\D/g, '');
+    return ADMIN_IDS.some(id => {
+        const n = normalizarTelAdmin(id);
+        return String(jid || '').includes(id) || (n && d.includes(n));
+    });
+}
+
+function pausaPorLargo(texto) {
+    const n = String(texto || '').length;
+    if (n <= 120) return 2500 + Math.random() * 1500;
+    if (n <= 400) return 4000 + Math.random() * 2000;
+    return 6000 + Math.random() * 2500;
+}
+
+async function pausaHumana(jid, texto) {
+    if (jidEsAdmin(jid)) return;
+    try { if (socketBot && isBotReady()) await socketBot.sendPresenceUpdate('composing', jid); } catch (e) {}
+    await new Promise(r => setTimeout(r, pausaPorLargo(texto)));
+    try { if (socketBot && isBotReady()) await socketBot.sendPresenceUpdate('paused', jid); } catch (e) {}
+}
+
+function saludoReciente(jid) {
+    const t = ultimosSaludos.get(String(jid || '')) || 0;
+    return Date.now() - t < 30 * 60 * 1000;
+}
+
+function registrarSaludo(jid) {
+    ultimosSaludos.set(String(jid || ''), Date.now());
+}
+
+/** Horario de atención: Lun-Vie 8:00-17:00, Sáb 8:00-12:00. */
+function horarioAtencion() {
+    const ahora = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Caracas' }));
+    const dia = ahora.getDay();
+    const h = ahora.getHours();
+    const abierto = (dia >= 1 && dia <= 5 && h >= 8 && h < 17) || (dia === 6 && h >= 8 && h < 12);
+    return { abierto, dia, hora: h };
+}
+
 /** Envía un texto largo dividiéndolo en varios mensajes sin cortar palabras. */
 async function enviarTexto(jid, texto, maxLen = 3500) {
     const t = String(texto || '');
     if (!t) return;
     if (t.length <= maxLen) {
+        await pausaHumana(jid, t);
         await safeSendMessage(jid, { text: t });
         return;
     }
     const lineas = t.split('\n');
     let bloque = '';
+    let primero = true;
+    const enviarBloque = async (b) => {
+        if (!b) return;
+        if (primero) {
+            await pausaHumana(jid, b);
+            primero = false;
+        } else if (!jidEsAdmin(jid)) {
+            try { if (socketBot && isBotReady()) await socketBot.sendPresenceUpdate('composing', jid); } catch (e) {}
+            await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000));
+        }
+        await safeSendMessage(jid, { text: b });
+    };
     for (const linea of lineas) {
         if ((bloque + '\n' + linea).length > maxLen && bloque) {
-            await safeSendMessage(jid, { text: bloque });
+            await enviarBloque(bloque);
             bloque = linea;
-            await new Promise(r => setTimeout(r, 1200));
         } else {
             bloque = bloque ? bloque + '\n' + linea : linea;
         }
     }
-    if (bloque) await safeSendMessage(jid, { text: bloque });
+    await enviarBloque(bloque);
 }
 
 function isBotReady() {
@@ -1490,6 +1547,11 @@ function primerNombre(nombre) {
 }
 
 async function enviarSaludoHumano(jid, nombre) {
+    if (saludoReciente(jid)) {
+        await safeSendMessage(jid, { text: '¿En qué te puedo ayudar?' });
+        return;
+    }
+    registrarSaludo(jid);
     const n = primerNombre(nombre);
     const saludo = saludoPorHoraCaracas();
     const variantes = n
@@ -1715,6 +1777,19 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     msg += `\n`;
                 });
                 await enviarTexto(from, msg.trim());
+                return true;
+            }
+        }
+
+        // 1w2) Consulta de producto rápida (admin, sin pasar por la IA)
+        if (/(?:^|\b)(cu[aá]l es|qu[eé] es|busco|b[uú]scame|tienes|tienen|hay|precio de|cu[aá]nto (?:cuesta|vale)|dame|mu[eé]strame)\b/i.test(t) &&
+            !/(estado de cuenta|factura|nota|cartera|record|status|tel[eé]fono|rif|zona|ruta|deuda|cliente|vendedor|cobrar|aniversario|visita)/i.test(t)) {
+            let consultaProd = t
+                .replace(/^(?:hola[,\s]+|buenas[,\s]+|estimado[,\s]+)/i, '')
+                .replace(/^(?:cu[aá]l es|qu[eé] es|busco|b[uú]scame|precio de|cu[aá]nto (?:cuesta|vale)|dame|mu[eé]strame|tienes|tienen|hay)\s+/i, '')
+                .trim();
+            if (consultaProd.length >= 4) {
+                await responderProductosIA(from, consultaProd);
                 return true;
             }
         }
@@ -2807,6 +2882,17 @@ async function obtenerTop10() {
     return null;
 }
 
+// Genera combinaciones de k palabras (para búsqueda progresiva 4→3→2).
+function combinacionesPalabras(arr, k) {
+    const res = [];
+    const rec = (ini, actual) => {
+        if (actual.length === k) { res.push([...actual]); return; }
+        for (let i = ini; i < arr.length; i++) { actual.push(arr[i]); rec(i + 1, actual); actual.pop(); }
+    };
+    rec(0, []);
+    return res;
+}
+
 async function buscarProductoPorTexto(texto) {
     // === REEMPLAZO DE MODELOS ESPECÍFICOS SOLICITADOS ===
     let textoBuscado = texto;
@@ -2931,6 +3017,37 @@ async function buscarProductoPorTexto(texto) {
         } catch (e) {
             console.log("Error Intento 3:", e.message);
         }
+    }
+
+    // Búsqueda progresiva: 4 palabras → 3 → 2, buscando al menos 2 coincidencias.
+    try {
+        const palabrasProg = [...new Set(palabrasBase)];
+        for (let k = Math.min(4, palabrasProg.length); k >= 2; k--) {
+            const combos = combinacionesPalabras(palabrasProg, k).slice(0, 25);
+            let mejor = [];
+            for (const combo of combos) {
+                const conds = combo.map(() => `(descripcion LIKE ? OR modelo LIKE ? OR fabrica LIKE ? OR marca LIKE ? OR tipo LIKE ?)`);
+                const params = [];
+                for (const w of combo) {
+                    const forma = expandirFormas(w)[0] || w;
+                    params.push(`%${forma}%`, `%${forma}%`, `%${forma}%`, `%${forma}%`, `%${forma}%`);
+                }
+                const [rows] = await pool.execute(
+                    `SELECT producto, descripcion, tipo, precio_minimo,
+                            (cantidad_existencia + cantidad_existencia_almacen) AS stock_total, cantidad_fabricando
+                     FROM tab_productos
+                     WHERE activo = 'si' AND ${conds.join(' AND ')}
+                     ORDER BY (COALESCE(cantidad_existencia,0) + COALESCE(cantidad_existencia_almacen,0)) DESC
+                     LIMIT 10`,
+                    params
+                );
+                if (rows.length > mejor.length) mejor = rows;
+                if (mejor.length >= 2) break;
+            }
+            if (mejor.length) return mejor;
+        }
+    } catch (e) {
+        console.log('Error búsqueda progresiva:', e.message);
     }
 
     return null;
@@ -4052,6 +4169,11 @@ async function startBot() {
             const from = msg.key.remoteJid;
             if (from === 'status@broadcast' || from.includes('@g.us')) return;
 
+            // Marcar como leído con un pequeño retraso (doble check azul más humano).
+            setTimeout(() => {
+                try { if (sock && isBotReady()) sock.readMessages([msg.key]); } catch (e) {}
+            }, 1200 + Math.floor(Math.random() * 800));
+
             // Deduplicación por ID de mensaje: evita procesar dos veces el mismo
             // mensaje cuando WhatsApp reenvía el evento o hay reconexiones.
             const mid = msg.key && msg.key.id;
@@ -4178,6 +4300,47 @@ async function startBot() {
             let nombreAlmacenado = null;
             if (sesion && sesion.datos) {
                 try { const d = JSON.parse(sesion.datos); nombreAlmacenado = d.nombre_cliente || null; } catch(e) {}
+            }
+
+            // --- HORARIO DE ATENCIÓN (solo clientes) ---
+            if (!isAdmin) {
+                const hor = horarioAtencion();
+                if (!hor.abierto) {
+                    const ultimoAviso = ultimoAvisoCerrado.get(from) || 0;
+                    if (Date.now() - ultimoAviso > 4 * 60 * 60 * 1000) {
+                        ultimoAvisoCerrado.set(from, Date.now());
+                        await safeSendMessage(from, { text: '🕐 Gracias por escribir a *ONE4CARS*.\n\nEn este momento estamos fuera de horario de atención (lunes a viernes de 8:00 a.m. a 5:00 p.m. y sábados de 8:00 a.m. a 12:00 m.).\n\nLe atenderemos en nuestro próximo horario. ¡Gracias por su paciencia!' });
+                    }
+                    return;
+                }
+            }
+
+            // --- DETECCIÓN DE FRUSTRACIÓN O PREGUNTA REPETIDA → ASESOR HUMANO ---
+            if (!isAdmin) {
+                const frasesFrustracion = [
+                    /hablar con (un|una) (asesor|persona|humano|operador|agente)/i,
+                    /quiero (un|una) (asesor|humano|persona|operador|agente)/i,
+                    /no me (est[aá]s|estas) (entendiendo|ayudando)/i,
+                    /^(no\s+)?(me\s+)?entiendes\b/i,
+                    /ya te (dije|expliqu[eé])/i,
+                    /esto no (funciona|sirve)/i,
+                    /p[eé]simo servicio|mal servicio/i
+                ];
+                const prev = ultimaPregunta.get(from);
+                const repetida = !!(prev && prev.texto === text && (Date.now() - prev.ts) < 10 * 60 * 1000 && text.length > 8);
+                ultimaPregunta.set(from, { texto: text, ts: Date.now() });
+                const frustrado = frasesFrustracion.some(r => r.test(rawText)) || repetida;
+                if (frustrado) {
+                    await silenciarChat(from);
+                    await safeSendMessage(from, { text: 'Entiendo. Le paso con un asesor humano para atenderle mejor. En breve le contactará. 🙌' });
+                    const nombreCli = nombreAlmacenado || pushName || 'Cliente';
+                    for (const id of ADMIN_IDS) {
+                        try {
+                            await safeSendMessage(formatWhatsApp(id), { text: `🙋 *SOLICITUD DE ASESOR HUMANO*\n\nCliente: *${nombreCli}*\nTeléfono: ${String(from).split('@')[0]}\nMotivo: ${repetida ? 'repitió la misma pregunta' : 'pidió hablar con una persona'}\nMensaje: ${String(rawText).slice(0, 200)}` });
+                        } catch (e) {}
+                    }
+                    return;
+                }
             }
 
             // Guardar nombre extraído para futuras conversaciones
@@ -4602,6 +4765,15 @@ async function startBot() {
                 const mencionaJose = text.includes('jos');
                 const saludoBase = text.startsWith('buenas tardes') ? 'tarde' :
                                    text.startsWith('buenas noches') ? 'noche' : 'dia';
+
+                const esMenu = text.startsWith('menu');
+                if (!esMenu && !mencionaJuan && !mencionaJose) {
+                    if (saludoReciente(from)) {
+                        await safeSendMessage(from, { text: '¿En qué te puedo ayudar?' });
+                        return;
+                    }
+                    registrarSaludo(from);
+                }
 
                 if (text.startsWith('menu')) {
                     await safeSendMessage(from, { text: `📋 *MENÚ PRINCIPAL ONE4CARS*\n\n${MENU_TEXT}` });
