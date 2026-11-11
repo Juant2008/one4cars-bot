@@ -13,7 +13,7 @@ function init(pool) { poolRef = pool; }
 async function rankingZonas(limite = 5) {
     try {
         const [rows] = await poolRef.query(
-            `SELECT c.zona,
+            `SELECT TRIM(c.zona) AS zona,
                     COUNT(DISTINCT c.id_cliente) AS clientes,
                     COUNT(DISTINCT CASE WHEN m.id_cliente IS NOT NULL THEN c.id_cliente END) AS en_mora,
                     ROUND(COALESCE(SUM(m.saldo), 0), 2) AS saldo_mora,
@@ -33,7 +33,7 @@ async function rankingZonas(limite = 5) {
                  GROUP BY id_cliente
              ) ult ON ult.id_cliente = c.id_cliente
              WHERE c.activo = 'SI' AND c.zona IS NOT NULL AND c.zona <> ''
-             GROUP BY c.zona`
+             GROUP BY TRIM(c.zona)`
         );
         const zonas = (rows || []).map(z => {
             const clientes = Number(z.clientes) || 0;
@@ -55,7 +55,7 @@ async function rankingZonas(limite = 5) {
 async function detalleZona(zona, limite = 10) {
     try {
         const [rows] = await poolRef.query(
-            `SELECT c.id_cliente, c.nombres, c.celular, c.zona,
+            `SELECT c.id_cliente, c.nombres, c.celular, TRIM(c.zona) AS zona,
                     COALESCE(m.saldo, 0) AS saldo,
                     COALESCE(m.dias, 0) AS dias_mora,
                     CASE WHEN ult.ultima IS NULL THEN NULL
@@ -75,7 +75,7 @@ async function detalleZona(zona, limite = 10) {
                  FROM tab_facturas WHERE anulado = 'no'
                  GROUP BY id_cliente
              ) ult ON ult.id_cliente = c.id_cliente
-             WHERE c.activo = 'SI' AND c.zona = ?
+             WHERE c.activo = 'SI' AND TRIM(c.zona) = ?
              ORDER BY (COALESCE(m.saldo,0) > 0) DESC,
                       COALESCE(m.saldo, 0) DESC,
                       (ult.ultima IS NULL) DESC,
@@ -94,23 +94,36 @@ function money(n) {
     return Number(n || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+function normZona(s) {
+    return String(s || '')
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase().trim();
+}
+
+// Coincidencia por PALABRA: "este" NO debe coincidir con "oeste".
+function coincideZona(zona, term) {
+    const z = normZona(zona);
+    const t = normZona(term);
+    if (!t) return false;
+    const esc = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(z);
+}
+
 async function buscarZona(term) {
-    try {
-        const [rows] = await poolRef.query(
-            "SELECT DISTINCT zona FROM tab_clientes WHERE zona IS NOT NULL AND zona <> '' AND zona LIKE ? ORDER BY zona LIMIT 1",
-            [`%${term}%`]
-        );
-        return rows && rows[0] ? rows[0].zona : null;
-    } catch (e) { return null; }
+    const zonas = await buscarZonas(term, 1);
+    return zonas.length ? zonas[0] : null;
 }
 
 async function buscarZonas(term, limite = 20) {
     try {
         const [rows] = await poolRef.query(
-            "SELECT DISTINCT zona FROM tab_clientes WHERE zona IS NOT NULL AND zona <> '' AND zona LIKE ? ORDER BY zona LIMIT ?",
-            [`%${term}%`, Number(limite) || 20]
+            "SELECT DISTINCT zona FROM tab_clientes WHERE zona IS NOT NULL AND zona <> '' AND zona LIKE ? ORDER BY zona LIMIT 300",
+            [`%${term}%`]
         );
-        return (rows || []).map(r => r.zona);
+        const filtradas = (rows || [])
+            .map(r => String(r.zona || '').trim())
+            .filter(z => z && coincideZona(z, term));
+        return [...new Set(filtradas)].slice(0, Number(limite) || 20);
     } catch (e) { return []; }
 }
 
@@ -170,6 +183,81 @@ async function otraRuta(telefono) {
     return `🔁 *Otra opción (${st.i + 1}/${st.zonas.length})*\n\n${txt}`;
 }
 
+async function textoClientesZona(term) {
+    const zonas = await buscarZonas(term, 50);
+    if (!zonas.length) return `No encontré zonas que contengan "*${term}*".`;
+    const marcas = zonas.map(() => '?').join(',');
+    const [rows] = await poolRef.query(
+        `SELECT c.id_cliente, c.nombres, c.zona, c.celular,
+                COALESCE(p.pend, 0) AS pend,
+                COALESCE(p.vencido, 0) AS vencido,
+                COALESCE(p.nfact, 0) AS nfact,
+                COALESCE(p.dias, 0) AS dias,
+                u.ultima,
+                CASE WHEN u.ultima IS NULL THEN NULL ELSE DATEDIFF(CURDATE(), u.ultima) END AS dias_sin_comprar
+         FROM tab_clientes c
+         LEFT JOIN (
+             SELECT f.id_cliente,
+                    SUM(f.total - f.abono_factura) AS pend,
+                    SUM(CASE WHEN DATEDIFF(CURDATE(), f.fecha_reg) >= 30 THEN f.total - f.abono_factura ELSE 0 END) AS vencido,
+                    COUNT(*) AS nfact,
+                    MAX(DATEDIFF(CURDATE(), f.fecha_reg)) AS dias
+             FROM tab_facturas f
+             WHERE f.pagada = 'NO' AND f.anulado = 'no'
+             GROUP BY f.id_cliente
+         ) p ON p.id_cliente = c.id_cliente
+         LEFT JOIN (
+             SELECT id_cliente, MAX(fecha_reg) AS ultima
+             FROM tab_facturas WHERE anulado = 'no' GROUP BY id_cliente
+         ) u ON u.id_cliente = c.id_cliente
+         WHERE c.activo = 'SI' AND TRIM(c.zona) IN (${marcas})
+         ORDER BY TRIM(c.zona) ASC,
+                  COALESCE(p.dias, 0) DESC,
+                  COALESCE(p.vencido, 0) DESC,
+                  c.nombres`,
+        zonas
+    );
+    const clientes = rows || [];
+    const conVencida = clientes.filter(c => Number(c.vencido) > 0);
+    const conPendiente = clientes.filter(c => Number(c.pend) > 0 && Number(c.vencido) <= 0);
+    const alDia = clientes.filter(c => Number(c.pend) <= 0 && c.ultima);
+    const sinCompras = clientes.filter(c => !c.ultima);
+    const totalVencido = conVencida.reduce((a, c) => a + Number(c.vencido), 0);
+    const totalPend = clientes.reduce((a, c) => a + Number(c.pend), 0);
+
+    let msg = `🗺️ *ZONA "${term.toUpperCase()}"*\n`;
+    msg += `Zonas: ${zonas.join(' · ')}\n\n`;
+    msg += `• Clientes activos: *${clientes.length}*\n`;
+    msg += `• Con factura vencida: *${conVencida.length}* → *$${money(totalVencido)}*\n`;
+    msg += `• Con deuda no vencida: *${conPendiente.length}*\n`;
+    msg += `• Al día (compró y no debe): *${alDia.length}*\n`;
+    msg += `• Sin compras registradas: *${sinCompras.length}*\n`;
+    msg += `• Total pendiente: *$${money(totalPend)}*\n`;
+    msg += `\n_Ordenados por zona y días de vencimiento (más viejo primero)._`;
+
+    const porZona = new Map();
+    for (const c of clientes) {
+        const z = c.zona || 'SIN ZONA';
+        if (!porZona.has(z)) porZona.set(z, []);
+        porZona.get(z).push(c);
+    }
+    const zonasOrdenadas = [...porZona.keys()].sort((a, b) => String(a).localeCompare(String(b), 'es'));
+    for (const zona of zonasOrdenadas) {
+        const lista = porZona.get(zona);
+        msg += `\n*${zona}* (${lista.length})\n`;
+        lista.forEach((c, i) => {
+            let estado = '⚪ Sin compras';
+            if (Number(c.vencido) > 0) estado = `🔴 Vencido $${money(c.vencido)} (${c.dias}d)`;
+            else if (Number(c.pend) > 0) estado = `🟡 Debe $${money(c.pend)} (${c.dias}d, no vencida)`;
+            else if (c.ultima) estado = `✅ Al día · últ. ${new Date(c.ultima).toLocaleDateString('es-VE')}`;
+            msg += `${i + 1}. ${c.nombres} — ${estado}`;
+            if (c.celular) msg += ` · 📞 ${String(c.celular).trim()}`;
+            msg += `\n`;
+        });
+    }
+    return msg.trim();
+}
+
 async function textoZona(term) {
     const zonas = await buscarZonas(term, 25);
     if (!zonas.length) return `No encontré una zona que coincida con "*${term}*".`;
@@ -205,4 +293,5 @@ async function textoZona(term) {
     return msg.trim();
 }
 
-module.exports = { init, rankingZonas, detalleZona, textoRuta, textoZona, buscarZona, otraRuta, tieneSesion };
+module.exports = { init, rankingZonas, detalleZona, textoRuta, textoZona, textoClientesZona, buscarZona, buscarZonas, otraRuta, tieneSesion };
+

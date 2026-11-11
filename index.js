@@ -1489,9 +1489,9 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                 let cand = mZonaTerm[1].trim();
                 cand = cand.replace(/^(?:(?:el|la|los|las|en|de|del|zona)\s+)+/i, '').trim();
                 try {
-                    const [zr] = await pool.execute("SELECT DISTINCT zona FROM tab_clientes WHERE zona LIKE ? LIMIT 1", [`%${cand}%`]);
-                    if (zr && zr[0]) {
-                        zonaFiltro = zr[0].zona;
+                    const zs = await rutas.buscarZonas(cand, 1);
+                    if (zs.length) {
+                        zonaFiltro = zs[0];
                         term = term.slice(0, mZonaTerm.index).replace(/(?:\s+(?:de|del|en|zona))+\s*$/i, '').trim();
                     }
                 } catch (e) {}
@@ -1791,6 +1791,17 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             } catch (e) {
                 console.log('[ACCION] Error recordatorio:', e.message);
                 await safeSendMessage(from, { text: `❌ No pude procesar el recordatorio: ${e.message}` });
+                return true;
+            }
+        }
+
+        // 1z0) Detalle de todos los clientes de una zona (por palabra)
+        const mZonaCli = t.match(/^(?:zona|clientes?\s+(?:de|en|del))\s+(.+)/i)
+            || t.match(/^clientes?\s+de\s+la\s+zona\s+(.+)/i);
+        if (mZonaCli) {
+            const zterm = mZonaCli[1].replace(/[?.!]+$/g, '').trim();
+            if (zterm) {
+                await enviarTexto(from, await rutas.textoClientesZona(zterm));
                 return true;
             }
         }
