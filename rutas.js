@@ -223,15 +223,16 @@ async function textoClientesZona(term) {
     const alDia = clientes.filter(c => Number(c.pend) <= 0 && c.ultima);
     const sinCompras = clientes.filter(c => !c.ultima);
     const totalVencido = conVencida.reduce((a, c) => a + Number(c.vencido), 0);
+    const totalNoVencido = conPendiente.reduce((a, c) => a + Number(c.pend), 0);
     const totalPend = clientes.reduce((a, c) => a + Number(c.pend), 0);
 
     let msg = `🗺️ *ZONA "${term.toUpperCase()}"*\n`;
     msg += `Zonas: ${zonas.join(' · ')}\n\n`;
     msg += `• Clientes activos: *${clientes.length}*\n`;
-    msg += `• Con factura vencida: *${conVencida.length}* → *$${money(totalVencido)}*\n`;
-    msg += `• Con deuda no vencida: *${conPendiente.length}*\n`;
-    msg += `• Al día (compró y no debe): *${alDia.length}*\n`;
-    msg += `• Sin compras registradas: *${sinCompras.length}*\n`;
+    msg += `• 🔴 Con factura VENCIDA: *${conVencida.length}* → *$${money(totalVencido)}*\n`;
+    msg += `• 🧾 Con factura NO vencida: *${conPendiente.length}* → *$${money(totalNoVencido)}* _(no visitar aún)_\n`;
+    msg += `• ✅ Al día (compró y no debe): *${alDia.length}*\n`;
+    msg += `• ⚪ Sin compras registradas: *${sinCompras.length}*\n`;
     msg += `• Total pendiente: *$${money(totalPend)}*\n`;
     msg += `\n_Ordenados por zona y días de vencimiento (más viejo primero)._`;
 
@@ -247,8 +248,8 @@ async function textoClientesZona(term) {
         msg += `\n*${zona}* (${lista.length})\n`;
         lista.forEach((c, i) => {
             let estado = '⚪ Sin compras';
-            if (Number(c.vencido) > 0) estado = `🔴 Vencido $${money(c.vencido)} (${c.dias}d)`;
-            else if (Number(c.pend) > 0) estado = `🟡 Debe $${money(c.pend)} (${c.dias}d, no vencida)`;
+            if (Number(c.vencido) > 0) estado = `🔴 *VENCIDA* $${money(c.vencido)} · ${c.dias}d`;
+            else if (Number(c.pend) > 0) estado = `🧾 Factura $${money(c.pend)} · ${c.dias}d · *NO vencida* (no visitar aún)`;
             else if (c.ultima) estado = `✅ Al día · últ. ${new Date(c.ultima).toLocaleDateString('es-VE')}`;
             msg += `${i + 1}. ${c.nombres} — ${estado}`;
             if (c.celular) msg += ` · 📞 ${String(c.celular).trim()}`;
