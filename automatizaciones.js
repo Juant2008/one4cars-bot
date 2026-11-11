@@ -300,7 +300,7 @@ async function chequearCarrito() {
            AND i.fecha > DATE_SUB(NOW(), INTERVAL 7 DAY)
            AND NOT EXISTS (
                SELECT 1 FROM tab_facturas f
-               WHERE REPLACE(REPLACE(f.celular,' ',''),'+','') = REPLACE(REPLACE(i.telefono,' ',''),'+','')
+               WHERE REPLACE(REPLACE(f.celular,' ',''),'+','') COLLATE utf8_unicode_ci = REPLACE(REPLACE(i.telefono,' ',''),'+','')
                  AND f.fecha_reg >= DATE(i.fecha)
            )
          ORDER BY i.fecha ASC

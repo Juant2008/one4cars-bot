@@ -228,6 +228,9 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
     console.log("[UNCAUGHT] Error crítico:", err?.message || err);
 });
+process.on('unhandledRejection', (err) => {
+    console.log("[UNHANDLED] Promesa rechazada:", err && err.message ? err.message : err);
+});
 
 // MODULOS EXTERNOS
 const cobranza = require('./cobranza');
@@ -419,6 +422,7 @@ let socketBot = null;
 let botStarting = false; // Mutex para evitar llamadas concurrentes a startBot()
 let dolarInfo = { bcv: 'Cargando...', paralelo: 'Cargando...', binance: 'Cargando...' };
 let notificadorInterval = null;
+let fallosConexionWatchdog = 0;
 const pendientesConfirmacion = new Map();
 const carritoCompras = new Map();
 const agendaVisitas = new Map();
@@ -683,14 +687,61 @@ function esEnvioBotReciente(jid, texto) {
     return arr.some(x => x.texto === t && (ahora - x.ts) < 30000);
 }
 
+// Cola de reintento de mensajes salientes (si el socket está caído o falla el envío).
+const outboxPendientes = [];
+let outboxTimer = null;
+
+function programarFlushOutbox() {
+    if (outboxTimer) return;
+    outboxTimer = setInterval(async () => {
+        if (!isBotReady() || !outboxPendientes.length) return;
+        const lote = outboxPendientes.splice(0, 5);
+        for (const it of lote) {
+            try {
+                await socketBot.sendMessage(it.jid, it.content);
+                registrarEnvioBot(it.jid, extraerTextoContenido(it.content));
+                console.log(`[OUTBOX] Reintento enviado a ${it.jid}`);
+            } catch (e) {
+                it.intentos = (it.intentos || 0) + 1;
+                if (it.intentos < 6) outboxPendientes.push(it);
+                else console.log(`[OUTBOX] Descartado tras 6 intentos: ${e.message}`);
+            }
+            await new Promise(r => setTimeout(r, 700));
+        }
+    }, 10000);
+    if (outboxTimer.unref) outboxTimer.unref();
+}
+
+async function flushOutbox() {
+    if (!isBotReady() || !outboxPendientes.length) return;
+    const lote = outboxPendientes.splice(0, 10);
+    for (const it of lote) {
+        try {
+            await socketBot.sendMessage(it.jid, it.content);
+            registrarEnvioBot(it.jid, extraerTextoContenido(it.content));
+            console.log(`[OUTBOX] Enviado al reconectar a ${it.jid}`);
+        } catch (e) {
+            it.intentos = (it.intentos || 0) + 1;
+            if (it.intentos < 6) outboxPendientes.push(it);
+        }
+    }
+}
+
 async function safeSendMessage(jid, content) {
     try {
         if (!socketBot) throw new Error("Socket no inicializado");
+        if (!isBotReady()) throw new Error("Bot no conectado");
         registrarEnvioBot(jid, extraerTextoContenido(content));
         await socketBot.sendMessage(jid, content);
         console.log(`[MSG] ✅ Mensaje enviado a ${jid}`);
     } catch (e) {
         console.log(`[MSG] ❌ Error enviando mensaje:`, e.message);
+        const errorConexion = !isBotReady() || /undefined|socket|connection|closed|timed out|ECONN|Stream|rate|not connected/i.test(String(e.message || ''));
+        if (errorConexion && outboxPendientes.length < 300) {
+            outboxPendientes.push({ jid, content, intentos: 0, ts: Date.now() });
+            programarFlushOutbox();
+            console.log(`[OUTBOX] Mensaje encolado para reintento (${outboxPendientes.length} pendientes).`);
+        }
     }
 }
 
@@ -1375,12 +1426,14 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
     if (!t) return false;
     const tl = t.toLowerCase();
 
-    // 1) Factura firmada / link de factura
-    if (/factura/i.test(tl) && /(firmada|firmado|pdf|link|imagen|reporte)/i.test(tl)) {
+    // 1) Factura / Nota firmada (acepta "factura 6331", "nota 6331", "factura firmada 6331")
+    const mNumFact = t.match(/(?:factura|nota)\s*(?:n[°ºo]?\.?\s*|#\s*|número\s*|nro\.?\s*)?(\d{2,6})\b/i);
+    const pideFactura = mNumFact || (/factura/i.test(tl) && /(firmada|firmado|pdf|link|imagen|reporte)/i.test(tl));
+    if (pideFactura) {
         if (!isAdmin) return false;
-        const m = t.match(/(?:n[°ºo]?\.?\s*|#\s*)?(\d{2,6})\b/);
+        const m = mNumFact || t.match(/(?:n[°ºo]?\.?\s*|#\s*)?(\d{2,6})\b/);
         if (!m) {
-            await safeSendMessage(from, { text: '🧾 Indíqueme el número de factura. Ejemplo: *factura firmada 6331*' });
+            await safeSendMessage(from, { text: '🧾 Indíqueme el número de factura. Ejemplo: *factura 6331* o *nota 6331*' });
             return true;
         }
         const f = await buscarFacturaPorNumero(parseInt(m[1], 10));
@@ -3850,9 +3903,11 @@ async function startBot() {
         if (connection) console.log(`[BOT] Estado de conexión: ${connection}`);
         if (connection === 'open') { 
             botStarting = false;
+            fallosConexionWatchdog = 0;
             qrCodeData = "ONLINE ✅";
             pairingCodeData = null;
             console.log(`🚀 BOT MASTER ONLINE (v${BOT_VERSION})`);
+            setTimeout(() => flushOutbox().catch(() => {}), 3000);
             if (!notificadorInterval) {
                 // MARCAR FACTURAS VIEJAS ANTES DE ACTIVAR NOTIFICADORES
                 await marcarFacturasViejasComoNotificadas();
@@ -3919,6 +3974,9 @@ async function startBot() {
                 }
                 // Si es un mensaje que el propio bot acaba de enviar automáticamente, NO silenciar.
                 const textoSaliente = m.message.conversation || m.message.extendedTextMessage?.text || m.message.imageMessage?.caption || '';
+                // Ignorar eventos salientes sin texto real (acks, reacciones, media sin caption, protocolos):
+                // antes silenciaban el chat por error y el bot dejaba de responder.
+                if (!String(textoSaliente).trim()) continue;
                 if (esEnvioBotReciente(jid, textoSaliente)) {
                     continue;
                 }
@@ -4044,6 +4102,20 @@ async function startBot() {
             }
 
             const sesion = await getSesion(from);
+
+            // Si el gerente quedó atrapado en un flujo pendiente (pedido, vendedor, cliente),
+            // cualquier comando suyo lo cancela y vuelve al modo normal.
+            if (isAdmin && sesion && ['esperando_vendedor', 'esperando_cliente', 'esperando_pedido'].includes(String(sesion.modo || ''))) {
+                const pareceComando = /^(ruta|zona|factura|nota|estado|record|cartera|comandos|cola|campana|campaña|resumen|cliente|quien|quién|qu[eé]|cu[aá]l|tel[eé]fono|rif|tipo|saldo|licencia|no cobrar|reactivar|silenciados|aprende|dudas)/i.test(rawText.trim());
+                if (pareceComando) {
+                    await clearSesionDatos(from);
+                    await setModo(from, 'bot');
+                    sesion.modo = 'bot';
+                    sesion.datos = null;
+                    console.log('[ADMIN] Flujo pendiente cancelado para comando del gerente.');
+                }
+            }
+
             let nombreAlmacenado = null;
             if (sesion && sesion.datos) {
                 try { const d = JSON.parse(sesion.datos); nombreAlmacenado = d.nombre_cliente || null; } catch(e) {}
@@ -4149,6 +4221,33 @@ async function startBot() {
                 .toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
             if (isAdmin && /^(comandos|comandos admin|menu comandos|menu gerente)$/.test(textoMenu)) {
                 return await safeSendMessage(from, { text: menuGerente() });
+            }
+
+            // --- 0a00b. REACTIVAR TODOS LOS CHATS (ADMIN) ---
+            if (isAdmin && (text === 'reactivar todos' || text === 'reactivar chats' || text === 'bot on' || text === 'activar bot')) {
+                try {
+                    const [r] = await pool.execute("UPDATE control_chat SET modo='bot' WHERE modo <> 'bot'");
+                    chatsSilenciados.clear();
+                    return await safeSendMessage(from, { text: `✅ Bot reactivado en *${r.affectedRows}* chat(s).\n\nDesde ahora el bot responderá de nuevo en todos los chats.` });
+                } catch (e) {
+                    return await safeSendMessage(from, { text: `❌ Error reactivando chats: ${e.message}` });
+                }
+            }
+
+            // --- 0a00c. VER CHATS SILENCIADOS (ADMIN) ---
+            if (isAdmin && (text === 'silenciados' || text === 'chats silenciados')) {
+                try {
+                    const [rows] = await pool.execute("SELECT telefono, usuario, updated_at FROM control_chat WHERE modo = 'humano' ORDER BY updated_at DESC LIMIT 30");
+                    if (!rows.length) return await safeSendMessage(from, { text: '✅ No hay chats silenciados. El bot responde en todos.' });
+                    let msg = `🔇 *CHATS EN MODO HUMANO (${rows.length})*\n\n`;
+                    rows.forEach(r => {
+                        msg += `• ${r.usuario || r.telefono} · ${new Date(r.updated_at).toLocaleString('es-VE')}\n`;
+                    });
+                    msg += `\nPara reactivar todos: *reactivar todos*`;
+                    return await enviarTexto(from, msg);
+                } catch (e) {
+                    return await safeSendMessage(from, { text: `❌ Error: ${e.message}` });
+                }
             }
 
             // --- 0a0. CONSULTAS RÁPIDAS: FACTURA FIRMADA, DATOS DE CLIENTE, BCV ---
@@ -7682,4 +7781,15 @@ server.listen(PORT, process.env.BIND_HOST || '0.0.0.0', async () => {
             }
         } catch (e) { console.log('[RESUMEN] Error:', e.message); }
     }, 60000);
+
+    // Watchdog de conexión: si lleva 15 min sin conexión, reinicia el proceso (pm2 lo levanta).
+    setInterval(() => {
+        if (isBotReady()) { fallosConexionWatchdog = 0; return; }
+        fallosConexionWatchdog++;
+        console.log(`[WATCHDOG] Sin conexión (${fallosConexionWatchdog}/3)...`);
+        if (fallosConexionWatchdog >= 3) {
+            console.log('[WATCHDOG] Reiniciando proceso para recuperar la conexión...');
+            process.exit(1);
+        }
+    }, 5 * 60 * 1000);
 });

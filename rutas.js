@@ -104,6 +104,16 @@ async function buscarZona(term) {
     } catch (e) { return null; }
 }
 
+async function buscarZonas(term, limite = 20) {
+    try {
+        const [rows] = await poolRef.query(
+            "SELECT DISTINCT zona FROM tab_clientes WHERE zona IS NOT NULL AND zona <> '' AND zona LIKE ? ORDER BY zona LIMIT ?",
+            [`%${term}%`, Number(limite) || 20]
+        );
+        return (rows || []).map(r => r.zona);
+    } catch (e) { return []; }
+}
+
 const sesiones = new Map(); // telefono -> { zonas: [...], i: 0 }
 
 function tieneSesion(telefono) {
@@ -111,13 +121,13 @@ function tieneSesion(telefono) {
 }
 
 async function textoRuta(telefono) {
-    const ranking = await rankingZonas(10);
+    const ranking = await rankingZonas(100);
     if (!ranking.length) return 'No encontré zonas con clientes activos.';
     sesiones.set(String(telefono || ''), { zonas: ranking.map(z => z.zona), i: 0 });
     let msg = `🗺️ *RUTA RECOMENDADA DE HOY*\n_Prioriza cobranza vencida y concentración de clientes._\n\n`;
 
     const top = ranking[0];
-    const detalle = await detalleZona(top.zona, 8);
+    const detalle = await detalleZona(top.zona, 200);
     msg += `🏆 *${top.zona}* — puntaje *${top.score}*\n`;
     msg += `• Clientes activos: *${top.clientes}*\n`;
     msg += `• Con facturas vencidas: *${top.enMora}* por *$${money(top.saldo)}*\n`;
@@ -136,7 +146,7 @@ async function textoRuta(telefono) {
         msg += `\n`;
     }
 
-    const otras = ranking.slice(1, 6);
+    const otras = ranking.slice(1);
     if (otras.length) {
         msg += `📌 *Otras zonas con potencial:*\n`;
         otras.forEach((z, i) => {
@@ -161,11 +171,26 @@ async function otraRuta(telefono) {
 }
 
 async function textoZona(term) {
-    const zona = await buscarZona(term);
-    if (!zona) return `No encontré una zona que coincida con "*${term}*".`;
-    const ranking = await rankingZonas(100);
+    const zonas = await buscarZonas(term, 25);
+    if (!zonas.length) return `No encontré una zona que coincida con "*${term}*".`;
+
+    // Si hay varias coincidencias, mostrarlas todas para que elija.
+    if (zonas.length > 1) {
+        const ranking = await rankingZonas(200);
+        const mapa = new Map(ranking.map(z => [z.zona, z]));
+        let msg = `🗺️ *ZONAS QUE COINCIDEN CON "${term}" (${zonas.length})*\n\n`;
+        zonas.forEach((z, i) => {
+            const info = mapa.get(z) || { clientes: 0, enMora: 0, saldo: 0, frios: 0 };
+            msg += `${i + 1}. *${z}* — ${info.clientes} clientes · ${info.enMora} en mora ($${money(info.saldo)}) · ${info.frios} fríos\n`;
+        });
+        msg += `\nEscribe *ruta NOMBRE EXACTO* para ver el detalle de una.`;
+        return msg.trim();
+    }
+
+    const zona = zonas[0];
+    const ranking = await rankingZonas(200);
     const info = ranking.find(z => z.zona === zona) || { zona, clientes: 0, enMora: 0, saldo: 0, frios: 0, score: 0 };
-    const detalle = await detalleZona(zona, 15);
+    const detalle = await detalleZona(zona, 200);
     let msg = `🗺️ *ZONA ${zona}*\n\n• Clientes activos: *${info.clientes}*\n• Con facturas vencidas: *${info.enMora}* por *$${money(info.saldo)}*\n• Sin comprar +90 días: *${info.frios}*\n\n`;
     if (detalle.length) {
         msg += `*Clientes:*\n`;
