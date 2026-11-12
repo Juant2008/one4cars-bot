@@ -2300,7 +2300,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
 
         // 1z0a) Plan de visitas POR ZONA
-        if (/plan\s+de\s+visitas?\s+(?:por|en)\s+zonas?|visitas?\s+por\s+zonas?|ruta\s+por\s+zonas?/i.test(t)) {
+        if (/plan\s+de\s+visitas?[\s\S]{0,25}zonas?|visitas?\s+(?:por|en)\s+(?:las\s+)?zonas?|ruta\s+(?:de\s+)?(?:visitas?\s+)?(?:por|en)\s+(?:las\s+)?zonas?|zonas?\s+(?:a|para)\s+visitar|qu[eé]\s+zonas?\s+(?:debo|deber[ií]a|me\s+conviene)\s+visitar|(?:organizar|planificar|armar|preparar)\s+(?:las\s+)?visitas?[\s\S]{0,18}zonas?/i.test(t)) {
             try {
                 const candidatos = await calcularClientesVisita();
                 if (!candidatos.length) {
@@ -2318,10 +2318,12 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     total: lista.length,
                     score: lista.reduce((a, b) => a + b.score, 0),
                     lista: lista.slice(0, 4)
-                })).sort((a, b) => b.score - a.score).slice(0, 6);
+                })).sort((a, b) => b.score - a.score);
+                const totalZonas = zonas.length;
+                const topZonas = zonas.slice(0, 8);
 
-                let msg = `🗺️ *PLAN DE VISITAS POR ZONA*\n_Criterios: compras, tiempo sin comprar y forma de pago._\n`;
-                zonas.forEach((z, i) => {
+                let msg = `🗺️ *PLAN DE VISITAS POR ZONA*\n_Criterios: compras, tiempo sin comprar y forma de pago._\n_${candidatos.length} clientes en ${totalZonas} zona(s)._\n`;
+                topZonas.forEach((z, i) => {
                     msg += `\n*${i + 1}. ${z.zona}* — ${z.total} cliente(s) · score ${z.score.toFixed(1)}\n`;
                     z.lista.forEach((c) => {
                         msg += `• *${c.nombres}* — score ${c.score} · hace ${c.dias}d · pago ${c.etiquetaPago}`;
@@ -2330,8 +2332,9 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                         if (c.celular) msg += ` · 📞 ${String(c.celular).trim()}`;
                         msg += `\n`;
                     });
-                    if (z.total > z.lista.length) msg += `… y ${z.total - z.lista.length} más en esta zona.\n`;
+                    if (z.total > z.lista.length) msg += `→ pide *zona ${z.zona}* para los ${z.total} clientes.\n`;
                 });
+                if (totalZonas > topZonas.length) msg += `\nHay ${totalZonas - topZonas.length} zona(s) más con menor potencial.\n`;
                 msg += `\n_Para el detalle de una zona: *zona NOMBRE*_`;
                 await enviarTexto(from, msg.trim());
                 return true;
