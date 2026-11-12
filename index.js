@@ -1606,6 +1606,73 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
+        // 1w00) ¿Qué empresa/cliente es la que MÁS ha comprado un producto?
+        const mTopProd = t.match(/(?:qu[eé]\s+(?:empresa|cliente)\s+es\s+la\s+que\s+m[aá]s\s+ha\s+comprado|qui[eé]n\s+(?:es\s+el\s+que\s+)?m[aá]s\s+ha\s+comprado|cu[aá]l\s+(?:empresa|cliente)\s+(?:ha\s+comprado|compr[oó])\s+m[aá]s|qui[eé]n\s+compr[oó]\s+m[aá]s)\s+(.+)/i);
+        if (mTopProd) {
+            const term = mTopProd[1].replace(/[?.!]+$/g, '').replace(/^["'“”]+|["'“”]+$/g, '').trim();
+            const buscarTop = async (col, val) => {
+                const [r] = await pool.execute(
+                    `SELECT c.id_cliente, c.nombres, c.celular,
+                            SUM(r.cantidad) AS unidades,
+                            COUNT(DISTINCT f.id_factura) AS facturas,
+                            ROUND(SUM(r.precio_total), 2) AS monto,
+                            MAX(f.fecha_reg) AS ultima
+                     FROM tab_facturas_reng r
+                     JOIN tab_facturas f ON f.id_factura = r.id_factura
+                     JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                     WHERE r.${col} = ? AND f.anulado = 'no'
+                     GROUP BY c.id_cliente
+                     ORDER BY unidades DESC
+                     LIMIT 10`,
+                    [val]
+                );
+                return r || [];
+            };
+            let rows = await buscarTop('producto', term);
+            if (!rows.length && /^\d+$/.test(term)) rows = await buscarTop('id_producto', parseInt(term, 10));
+            if (!rows.length) {
+                const [rr] = await pool.execute(
+                    `SELECT c.id_cliente, c.nombres, c.celular,
+                            SUM(r.cantidad) AS unidades,
+                            COUNT(DISTINCT f.id_factura) AS facturas,
+                            ROUND(SUM(r.precio_total), 2) AS monto,
+                            MAX(f.fecha_reg) AS ultima
+                     FROM tab_facturas_reng r
+                     JOIN tab_facturas f ON f.id_factura = r.id_factura
+                     JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                     WHERE r.producto LIKE ? AND f.anulado = 'no'
+                     GROUP BY c.id_cliente
+                     ORDER BY unidades DESC LIMIT 10`,
+                    [`%${term}%`]
+                ).catch(() => [[]]);
+                rows = rr || [];
+            }
+            if (!rows.length) {
+                await safeSendMessage(from, { text: `🔎 No encontré compras del producto "*${term}*" en facturas no anuladas.` });
+                return true;
+            }
+            let desc = '';
+            try {
+                const [p] = await pool.execute("SELECT descripcion FROM tab_productos WHERE producto = ? LIMIT 1", [term]);
+                if (p && p[0]) desc = String(p[0].descripcion || '').slice(0, 90);
+            } catch (e) {}
+            const top = rows[0];
+            let msg = `🏆 *EMPRESA QUE MÁS HA COMPRADO ${term}*\n`;
+            if (desc) msg += `_${desc}_\n`;
+            msg += `\n1. *${top.nombres}* — *${top.unidades} und* · ${top.facturas} fact. · *$${formatoBs(top.monto)}*\n`;
+            if (top.celular) msg += `   📞 ${String(top.celular).trim()}\n`;
+            if (top.ultima) msg += `   Última compra: ${new Date(top.ultima).toLocaleDateString('es-VE')}\n`;
+            if (rows.length > 1) {
+                msg += `\n*Ranking completo:*\n`;
+                rows.slice(1).forEach((c, i) => {
+                    msg += `${i + 2}. ${c.nombres} — ${c.unidades} und · ${c.facturas} fact. · $${formatoBs(c.monto)}\n`;
+                });
+            }
+            msg += `\n_Datos reales de facturas no anuladas._`;
+            await enviarTexto(from, msg.trim());
+            return true;
+        }
+
         // 1w0) ¿Qué es lo que más ha comprado un cliente? (datos reales, sin IA)
         const mTopCli = t.match(/(?:qu[eé]\s+(?:es\s+)?lo\s+que\s+m[aá]s\s+ha\s+comprado|qu[eé]\s+ha\s+comprado|qu[eé]\s+ha\s+pedido|qu[eé]\s+le\s+hemos\s+vendido\s+a|productos?\s+m[aá]s\s+comprados?\s+por|top\s+de\s+productos?\s+(?:de|para))\s+(.+)/i);
         if (mTopCli) {
