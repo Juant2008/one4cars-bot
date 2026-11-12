@@ -1707,8 +1707,10 @@ async function calcularClientesVisita() {
 
 /** Procesa consultas rápidas del dueño. Devuelve true si ya respondió. */
 async function atenderConsultaDueno(from, rawText, isAdmin) {
-    const t = String(rawText || '').trim();
+    let t = String(rawText || '').trim();
     if (!t) return false;
+    // Tolerancia a errores de escritura del gerente: "clienets", "clietes", "clientess" → "clientes"
+    t = t.replace(/\bclien[a-záéíóúñ]{0,8}\b/gi, (m) => (/^clientes?$/i.test(m) ? m : 'clientes'));
     const tl = t.toLowerCase();
     const tnAdmin = normalizar(t);
     // 0) GESTIÓN DE ADMINISTRADORES (solo gerentes)

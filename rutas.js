@@ -116,13 +116,24 @@ async function buscarZona(term) {
 
 async function buscarZonas(term, limite = 20) {
     try {
-        const [rows] = await poolRef.query(
-            "SELECT DISTINCT zona FROM tab_clientes WHERE zona IS NOT NULL AND zona <> '' AND zona LIKE ? ORDER BY zona LIMIT 300",
-            [`%${term}%`]
-        );
-        const filtradas = (rows || [])
-            .map(r => String(r.zona || '').trim())
-            .filter(z => z && coincideZona(z, term));
+        const consultar = async (q) => {
+            const [rows] = await poolRef.query(
+                "SELECT DISTINCT zona FROM tab_clientes WHERE zona IS NOT NULL AND zona <> '' AND zona LIKE ? ORDER BY zona LIMIT 300",
+                [`%${q}%`]
+            );
+            return (rows || [])
+                .map(r => String(r.zona || '').trim())
+                .filter(z => z && coincideZona(z, q));
+        };
+        let filtradas = await consultar(term);
+        // Si no aparece la zona completa, intentar con cada palabra significativa
+        if (!filtradas.length) {
+            const palabras = String(term || '').split(/\s+/).filter(p => p.length >= 4);
+            for (const p of [...palabras].sort((a, b) => b.length - a.length)) {
+                filtradas = await consultar(p);
+                if (filtradas.length) break;
+            }
+        }
         return [...new Set(filtradas)].slice(0, Number(limite) || 20);
     } catch (e) { return []; }
 }
