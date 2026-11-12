@@ -1610,7 +1610,14 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         const mPedidoEst = t.match(/(?:pedido|orden|reposici[oó]n|compra)\s+(?:estimad[oa]|sugerid[oa]|recomendad[oa])\s+(?:de\s+)?(?:productos?\s+)?(?:de|para)\s+(.+)/i)
             || t.match(/(?:qu[eé]\s+(?:le\s+)?(?:debo|deber[ií]a)\s+(?:pedir|sugerir|recomendar)|sugerir\s+pedido|sugiere\s+pedido|qu[eé]\s+le\s+vendo)\s+(?:a|para|de)\s+(.+)/i);
         if (mPedidoEst) {
-            const term = mPedidoEst[1].replace(/[?.!]+$/g, '').trim();
+            let term = mPedidoEst[1].replace(/[?.!]+$/g, '').trim();
+            // Quitar explicaciones y palabras genéricas: "... de avary, según el tiempo..."
+            term = term.split(/[,;]/)[0].trim();
+            term = term
+                .replace(/\b(?:seg[uú]n|de\s+acuerdo\s+con|basado\s+en|tomando\s+en\s+cuenta|considerando|con\s+base\s+en|en\s+funci[oó]n\s+de)\b[\s\S]*$/i, '')
+                .replace(/^(?:repuestos?|productos?|autopartes?|art[ií]culos?)\s+/i, '')
+                .replace(/[?.!]+$/g, '')
+                .trim();
             const clientes = await buscarClientesPorNombre(term);
             if (!clientes.length) {
                 await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
