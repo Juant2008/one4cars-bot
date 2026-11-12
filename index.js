@@ -1606,6 +1606,88 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
+        // 1w000) Pedido estimado / sugerido para un cliente (según su historial real)
+        const mPedidoEst = t.match(/(?:pedido|orden|reposici[oó]n|compra)\s+(?:estimad[oa]|sugerid[oa]|recomendad[oa])\s+(?:de\s+)?(?:productos?\s+)?(?:de|para)\s+(.+)/i)
+            || t.match(/(?:qu[eé]\s+(?:le\s+)?(?:debo|deber[ií]a)\s+(?:pedir|sugerir|recomendar)|sugerir\s+pedido|sugiere\s+pedido|qu[eé]\s+le\s+vendo)\s+(?:a|para|de)\s+(.+)/i);
+        if (mPedidoEst) {
+            const term = mPedidoEst[1].replace(/[?.!]+$/g, '').trim();
+            const clientes = await buscarClientesPorNombre(term);
+            if (!clientes.length) {
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                return true;
+            }
+            const c = clientes[0];
+            const pct = await obtenerPorcentaje();
+
+            const [fechas] = await pool.execute(
+                `SELECT fecha_reg FROM tab_facturas WHERE id_cliente = ? AND anulado = 'no' ORDER BY fecha_reg ASC`,
+                [c.id_cliente]
+            );
+            if (!fechas.length) {
+                await safeSendMessage(from, { text: `📭 *${c.nombres}* no tiene compras registradas para estimar un pedido.` });
+                return true;
+            }
+            const primera = new Date(fechas[0].fecha_reg);
+            const ultima = new Date(fechas[fechas.length - 1].fecha_reg);
+            const numFact = fechas.length;
+            const diasDesde = Math.max(0, Math.floor((Date.now() - ultima.getTime()) / 86400000));
+            const intervaloCliente = numFact > 1
+                ? Math.max(15, Math.round((ultima - primera) / 86400000 / (numFact - 1)))
+                : 60;
+            const proximoEn = Math.max(0, intervaloCliente - diasDesde);
+
+            const [items] = await pool.execute(
+                `SELECT r.producto,
+                        MAX(LEFT(p.descripcion, 90)) AS descripcion,
+                        SUM(r.cantidad) AS cantidad,
+                        MAX(COALESCE(p.precio_minimo, 0)) AS precio,
+                        MAX(COALESCE(p.cantidad_existencia,0) + COALESCE(p.cantidad_existencia_almacen,0)) AS stock
+                 FROM tab_facturas_reng r
+                 JOIN tab_facturas f ON f.id_factura = r.id_factura
+                 LEFT JOIN tab_productos p ON p.producto = r.producto
+                 WHERE f.id_cliente = ? AND f.anulado = 'no' AND f.fecha_reg = ?
+                 GROUP BY r.producto`,
+                [c.id_cliente, fechas[fechas.length - 1].fecha_reg]
+            );
+            if (!items.length) {
+                await safeSendMessage(from, { text: `📭 *${c.nombres}* no tiene detalle de productos en su última factura.` });
+                return true;
+            }
+
+            let msg = `🧾 *PEDIDO ESTIMADO — ${c.nombres}*\n`;
+            msg += `_Último pedido: ${ultima.toLocaleDateString('es-VE')} (hace ${diasDesde} días). Ritmo habitual: ~${intervaloCliente} días entre pedidos._\n\n`;
+
+            if (proximoEn > 0) {
+                msg += `⏳ *Todavía no toca reponer.* Según su ritmo, el próximo pedido sería en ~*${proximoEn} días*.\n\n`;
+                msg += `*Referencia de su último pedido:*\n`;
+                items.slice(0, 12).forEach((p, i) => {
+                    msg += `${i + 1}. *${p.producto}* — ${String(p.descripcion || '').slice(0, 65)}\n   *${p.cantidad} und*\n`;
+                });
+                if (items.length > 12) msg += `… y ${items.length - 12} más.\n`;
+                msg += `\n_Cuando se acerque la fecha, el bot puede armar el pedido con estas cantidades._`;
+                await enviarTexto(from, msg.trim());
+                return true;
+            }
+
+            let totalEstimado = 0;
+            msg += `✅ *Ya toca reponer* (han pasado ${diasDesde} días; su ritmo es ~${intervaloCliente}).\n\n*Pedido sugerido:*\n`;
+            items.slice(0, 20).forEach((p, i) => {
+                const cant = Math.max(1, Number(p.cantidad) || 1);
+                const precioUsd = Number(p.precio) > 0 ? (Number(p.precio) / (pct || 1)) : 0;
+                const subtotal = precioUsd * cant;
+                totalEstimado += subtotal;
+                msg += `${i + 1}. *${p.producto}* — ${String(p.descripcion || '').slice(0, 65)}\n   *${cant} und*`;
+                if (precioUsd > 0) msg += ` · $${formatoBs(subtotal)}`;
+                if (Number(p.stock) <= 0) msg += ` · ⚠️ sin stock`;
+                msg += `\n`;
+            });
+            if (items.length > 20) msg += `… y ${items.length - 20} más.\n`;
+            if (totalEstimado > 0) msg += `\n💰 *Total estimado: $${formatoBs(totalEstimado)}*`;
+            msg += `\n\n_Basado en las cantidades de su último pedido._`;
+            await enviarTexto(from, msg.trim());
+            return true;
+        }
+
         // 1w00) ¿Qué empresa/cliente es la que MÁS ha comprado un producto?
         const mTopProd = t.match(/(?:qu[eé]\s+(?:empresa|cliente)\s+es\s+la\s+que\s+m[aá]s\s+ha\s+comprado|qui[eé]n\s+(?:es\s+el\s+que\s+)?m[aá]s\s+ha\s+comprado|cu[aá]l\s+(?:empresa|cliente)\s+(?:ha\s+comprado|compr[oó])\s+m[aá]s|qui[eé]n\s+compr[oó]\s+m[aá]s)\s+(.+)/i);
         if (mTopProd) {
