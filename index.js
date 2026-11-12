@@ -1649,6 +1649,26 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             );
             const pendInfo = pend && pend[0] ? pend[0] : { n: 0, saldo: 0, dias: 0 };
 
+            // Si la última factura está pendiente de pago, excluir sus productos del pedido estimado.
+            let excluidosUlt = new Set();
+            let notaExcluidos = '';
+            try {
+                const [ultFact] = await pool.execute(
+                    `SELECT id_factura, nro_factura, pagada FROM tab_facturas
+                     WHERE id_cliente = ? AND anulado = 'no'
+                     ORDER BY fecha_reg DESC, id_factura DESC LIMIT 1`,
+                    [c.id_cliente]
+                );
+                if (ultFact && ultFact[0] && String(ultFact[0].pagada || '').toUpperCase() !== 'SI') {
+                    const [prodUlt] = await pool.execute(
+                        "SELECT DISTINCT producto FROM tab_facturas_reng WHERE id_factura = ?",
+                        [ultFact[0].id_factura]
+                    );
+                    excluidosUlt = new Set((prodUlt || []).map(x => String(x.producto)));
+                    notaExcluidos = `\n🚫 Se excluyeron *${excluidosUlt.size}* producto(s) de la factura *N° ${ultFact[0].nro_factura}* porque está *pendiente de pago*.`;
+                }
+            } catch (e) {}
+
             const [rows] = await pool.execute(
                 `SELECT r.producto,
                         MAX(LEFT(p.descripcion, 85)) AS descripcion,
@@ -1675,6 +1695,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
             const toca = [], proximos = [], unicas = [], alDia = [];
             for (const r of rows) {
+                if (excluidosUlt.has(String(r.producto))) continue;
                 const compras = Number(r.compras) || 0;
                 const dias = Number(r.dias) || 0;
                 const promedio = Number(r.promedio) || 0;
@@ -1713,6 +1734,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             if (Number(pendInfo.n) > 0) {
                 msg += `\n⚠️ *Factura pendiente:* ${pendInfo.n} por *$${formatoBs(pendInfo.saldo)}* (la más antigua con ${pendInfo.dias} días). Considere cobrar antes de despachar más.\n`;
             }
+            if (notaExcluidos) msg += notaExcluidos + `\n`;
 
             let totalEstimado = 0;
             if (toca.length) {
