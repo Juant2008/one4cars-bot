@@ -1354,14 +1354,39 @@ async function buscarFacturaPorNumero(nro) {
 async function buscarClientesPorNombre(term) {
     try {
         const t = String(term || '').trim();
+        const compacto = t.replace(/[^A-Za-z0-9ÁÉÍÓÚáéíóúñÑ]/g, '').toUpperCase();
+        const campos = `id_cliente, nombres, cedula, clave, celular, telefono, direccion, zona, vendedor, tipo, activo, cliente_oficina`;
         const [r] = await pool.execute(
-            `SELECT id_cliente, nombres, cedula, clave, celular, telefono, direccion, zona, vendedor, tipo, activo, cliente_oficina
+            `SELECT ${campos}
              FROM tab_clientes
              WHERE nombres LIKE ? OR clave LIKE ? OR cedula LIKE ?
+                OR REPLACE(REPLACE(REPLACE(UPPER(nombres),' ',''),'.',''),',','') LIKE ?
              ORDER BY nombres LIMIT 5`,
-            [`%${t}%`, `%${t}%`, `%${t}%`]
+            [`%${t}%`, `%${t}%`, `%${t}%`, `%${compacto}%`]
         );
-        return r || [];
+        if (r && r.length) return r;
+
+        // Segundo intento: todas las palabras del nombre deben aparecer (en cualquier orden)
+        const palabras = t.split(/\s+/).filter(p => p.length >= 3);
+        if (palabras.length > 1) {
+            const cond = palabras.map(() => 'UPPER(nombres) LIKE ?').join(' AND ');
+            const [r2] = await pool.execute(
+                `SELECT ${campos} FROM tab_clientes WHERE ${cond} ORDER BY nombres LIMIT 5`,
+                palabras.map(p => `%${p.toUpperCase()}%`)
+            );
+            if (r2 && r2.length) return r2;
+        }
+
+        // Tercer intento: la palabra más larga (tolerancia a errores leves)
+        const larga = [...palabras].sort((a, b) => b.length - a.length)[0];
+        if (larga && larga.length >= 5) {
+            const [r3] = await pool.execute(
+                `SELECT ${campos} FROM tab_clientes WHERE UPPER(nombres) LIKE ? ORDER BY nombres LIMIT 5`,
+                [`%${larga.toUpperCase()}%`]
+            );
+            if (r3 && r3.length) return r3;
+        }
+        return [];
     } catch (e) { return []; }
 }
 
@@ -2008,12 +2033,13 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
 
         // 1w0) ¿Qué es lo que más ha comprado un cliente? (datos reales, sin IA)
-        const mTopCli = t.match(/(?:qu[eé]\s+(?:es\s+)?lo\s+que\s+m[aá]s\s+ha\s+comprado|qu[eé]\s+ha\s+comprado|qu[eé]\s+ha\s+pedido|qu[eé]\s+le\s+hemos\s+vendido\s+a|productos?\s+m[aá]s\s+comprados?\s+por|top\s+de\s+productos?\s+(?:de|para))\s+(.+)/i);
+        const mTopCli = t.match(/(?:qu[eé]\s+(?:es\s+)?lo\s+que\s+(?:m[aá]s\s+)?(?:ha\s+|se\s+ha\s+)?compr[oó]|qu[eé]\s+(?:ha\s+|se\s+ha\s+)?(?:comprado|compr[oó])|qu[eé]\s+compra\b|qu[eé]\s+ha\s+pedido|qu[eé]\s+le\s+hemos\s+vendido\s+a|productos?\s+m[aá]s\s+comprados?\s+por|top\s+de\s+productos?\s+(?:de|para)|qu[eé]\s+se\s+llev[oó])\s+(.+)/i);
         if (mTopCli) {
             const term = mTopCli[1].replace(/[?.!]+$/g, '').trim();
             const clientes = await buscarClientesPorNombre(term);
             if (!clientes.length) {
-                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                const extra = /^\d{4,}$/.test(term) ? `\n\nSi buscabas las ventas de ese código, escribe: *quién compró ${term}*` : '';
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".${extra}` });
                 return true;
             }
             const c = clientes[0];
@@ -2060,7 +2086,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
 
         // 1w) ¿Qué clientes compraron el producto X? / ventas del producto X
-        const mCompra = t.match(/(?:qu[eé]|cu[aá]les|qui[eé]n(?:es)?)\s+(?:clientes?\s+)?(?:han?\s+)?(?:comprado|compraron|compr[oó]|compt[oó])\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
+        const mCompra = t.match(/(?:qui[eé]n(?:es)?|cu[aá]les\s+clientes?|qu[eé]\s+clientes?)\s+(?:han?\s+)?(?:comprado|compraron|compr[oó]|compt[oó])\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
             || t.match(/clientes?\s+que\s+(?:compraron|han\s+comprado)\s+(.+)/i)
             || t.match(/(?:a\s+qui[eé]n(?:es)?\s+(?:le\s+)?(?:hemos?\s+)?vendido)\s+(.+)/i)
             || t.match(/(?:cu[aá]les\s+fueron\s+las\s+)?ventas?\s+(?:del?|de)\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
