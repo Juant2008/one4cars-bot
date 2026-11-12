@@ -118,7 +118,9 @@ async function preguntar(pregunta) {
   try {
     const esquema = await cargarEsquema();
     const fecha = new Date().toLocaleDateString('es-VE', { timeZone: 'America/Caracas' });
-    const gen = await llamar([
+    let gen;
+    try {
+      gen = await llamar([
       {
         role: 'system',
         content: `Eres un analista de datos de ONE4CARS (autopartes al mayor en Venezuela).
@@ -144,7 +146,15 @@ REGLAS:
 - Devuelve SOLO JSON: {"sql":"SELECT ...","explicacion":"..."}`
       },
       { role: 'user', content: q }
-    ], 600);
+      ], 1000);
+    } catch (e) {
+      if (/JSON/i.test(e.message || '')) {
+        gen = await llamar([
+          { role: 'system', content: 'Devuelve SOLO un objeto JSON válido, sin markdown, con las claves "sql" y "explicacion". La SQL debe ser un único SELECT en una línea.' },
+          { role: 'user', content: q + '\n\nRecuerda: SOLO JSON válido.' }
+        ], 1000);
+      } else { throw e; }
+    }
 
     const sql = validarSQL(gen.sql);
     const inicio = Date.now();

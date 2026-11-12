@@ -2244,6 +2244,86 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             }
         }
 
+        // 1z0b) ¿Qué clientes debo visitar hoy? (compras + tiempo sin comprar + forma de pago)
+        if (/(?:qu[eé]|cu[aá]l(?:es)?)\s+(?:ser[ií]a\s+el\s+|es\s+el\s+)?clientes?\s+(?:que\s+)?(?:debo|deber[ií]a|me\s+conviene)\s+visitar|^clientes?\s+a\s+visitar|plan\s+de\s+visitas?|a\s+qui[eé]n(?:es)?\s+debo\s+visitar|qu[eé]\s+clientes?\s+visitar/i.test(t)) {
+            try {
+                const [rows] = await pool.execute(
+                    `SELECT c.id_cliente, c.nombres, TRIM(c.zona) AS zona, c.celular,
+                            MAX(f.fecha_reg) AS ultima,
+                            DATEDIFF(CURDATE(), MAX(f.fecha_reg)) AS dias,
+                            COUNT(DISTINCT f.id_factura) AS facturas,
+                            ROUND(SUM(f.total - f.abono_factura), 2) AS comprado,
+                            ROUND(SUM(CASE WHEN f.pagada = 'NO' THEN f.total - f.abono_factura ELSE 0 END), 2) AS pendiente,
+                            ROUND(SUM(CASE WHEN f.pagada = 'SI' AND f.dias_pago IS NOT NULL THEN
+                                (CASE WHEN f.dias_pago <= 7 THEN 100 WHEN f.dias_pago <= 15 THEN 88
+                                      WHEN f.dias_pago <= 30 THEN 72 WHEN f.dias_pago <= 45 THEN 55
+                                      WHEN f.dias_pago <= 60 THEN 38 WHEN f.dias_pago <= 90 THEN 22 ELSE 10 END)
+                                * LEAST(f.total, 2000) ELSE 0 END), 2) AS puntos,
+                            ROUND(SUM(CASE WHEN f.pagada = 'SI' AND f.dias_pago IS NOT NULL THEN LEAST(f.total, 2000) ELSE 0 END), 2) AS peso
+                     FROM tab_clientes c
+                     JOIN tab_facturas f ON f.id_cliente = c.id_cliente AND f.anulado = 'no'
+                     WHERE c.activo = 'SI' AND c.celular <> ''
+                     GROUP BY c.id_cliente
+                     HAVING facturas >= 1`
+                );
+                const candidatos = (rows || []).map(r => {
+                    const dias = Number(r.dias) || 0;
+                    const comprado = Number(r.comprado) || 0;
+                    const facturas = Number(r.facturas) || 0;
+                    const pendiente = Number(r.pendiente) || 0;
+                    const peso = Number(r.peso) || 0;
+                    const pagoScore = peso > 0 ? Math.round(Number(r.puntos) / peso) : 50;
+                    // Descartar clientes sin volumen real (facturas en cero o compras mínimas).
+                    if (comprado < 50 && facturas < 2) return null;
+                    let score = (pagoScore / 100) * 30;
+                    if (dias <= 30) score += 5;
+                    else if (dias <= 90) score += 20;
+                    else if (dias <= 180) score += 32;
+                    else if (dias <= 365) score += 35;
+                    else score += 8;
+                    score += Math.min(comprado / 1000, 30);
+                    score += pendiente > 0 ? -10 : 5;
+                    if (pagoScore < 64) score -= 15; // priorizar buena forma de pago
+                    const etiquetaPago = pagoScore >= 78 ? 'BUENA ✅' : (pagoScore >= 64 ? 'REGULAR ⚠️' : 'MALA 🔴');
+                    const motivo = [];
+                    if (pagoScore >= 78) motivo.push('buen pagador');
+                    if (dias >= 30 && dias <= 365) motivo.push(`hace ${dias}d sin comprar`);
+                    else if (dias > 365) motivo.push(`inactivo hace ${dias}d`);
+                    if (comprado >= 1000) motivo.push(`cliente de $${formatoBs(comprado)}`);
+                    if (pendiente > 0) motivo.push(`debe $${formatoBs(pendiente)}`);
+                    return {
+                        ...r,
+                        dias, comprado, facturas, pendiente, pagoScore, score: Math.round(score * 10) / 10,
+                        etiquetaPago, motivo: motivo.join(' · ')
+                    };
+                }).filter(Boolean);
+                candidatos.sort((a, b) => b.score - a.score);
+                const top = candidatos.slice(0, 10);
+                if (!top.length) {
+                    await safeSendMessage(from, { text: 'No encontré clientes con historial de compras para priorizar visitas.' });
+                    return true;
+                }
+                let msg = `🎯 *CLIENTES A VISITAR HOY*\n_Criterios: compras, tiempo sin comprar y forma de pago._\n\n`;
+                top.forEach((c, i) => {
+                    msg += `*${i + 1}. ${c.nombres}* — ${c.zona || 'sin zona'}\n`;
+                    msg += `   🏆 Score: *${c.score}/100*\n`;
+                    msg += `   • Compró *$${formatoBs(c.comprado)}* en ${c.facturas} factura(s) · última hace *${c.dias}d*\n`;
+                    msg += `   • Forma de pago: *${c.etiquetaPago}* (${c.pagoScore}/100)\n`;
+                    msg += `   • ${c.pendiente > 0 ? `Debe *$${formatoBs(c.pendiente)}*` : 'Sin deuda pendiente ✅'}\n`;
+                    if (c.motivo) msg += `   • Motivo: ${c.motivo}\n`;
+                    if (c.celular) msg += `   📞 ${String(c.celular).trim()}\n`;
+                    msg += `\n`;
+                });
+                msg += `_Ordenados por conveniencia de visita. Puedes pedir el detalle de cualquiera._`;
+                await enviarTexto(from, msg.trim());
+                return true;
+            } catch (e) {
+                console.log('[VISITAS] Error:', e.message);
+                await safeSendMessage(from, { text: `❌ No pude calcular las visitas: ${e.message}` });
+                return true;
+            }
+        }
+
         // 1z0) Detalle de todos los clientes de una zona (por palabra)
         const mZonaCli = t.match(/^(?:zona|clientes?\s+(?:de|en|del))\s+(.+)/i)
             || t.match(/^clientes?\s+de\s+la\s+zona\s+(.+)/i);
