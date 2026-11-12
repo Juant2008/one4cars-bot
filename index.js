@@ -1606,6 +1606,58 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
 
     // 2) Datos de cliente por nombre / RIF / cédula
     if (isAdmin) {
+        // 1w0) ¿Qué es lo que más ha comprado un cliente? (datos reales, sin IA)
+        const mTopCli = t.match(/(?:qu[eé]\s+(?:es\s+)?lo\s+que\s+m[aá]s\s+ha\s+comprado|qu[eé]\s+ha\s+comprado|qu[eé]\s+ha\s+pedido|qu[eé]\s+le\s+hemos\s+vendido\s+a|productos?\s+m[aá]s\s+comprados?\s+por|top\s+de\s+productos?\s+(?:de|para))\s+(.+)/i);
+        if (mTopCli) {
+            const term = mTopCli[1].replace(/[?.!]+$/g, '').trim();
+            const clientes = await buscarClientesPorNombre(term);
+            if (!clientes.length) {
+                await safeSendMessage(from, { text: `❌ No encontré un cliente que coincida con "*${term}*".` });
+                return true;
+            }
+            const c = clientes[0];
+            const [porUnidades] = await pool.execute(
+                `SELECT r.producto, MAX(LEFT(p.descripcion, 80)) AS descripcion,
+                        SUM(r.cantidad) AS unidades, COUNT(DISTINCT f.id_factura) AS facturas,
+                        ROUND(SUM(r.precio_total), 2) AS monto
+                 FROM tab_facturas_reng r
+                 JOIN tab_facturas f ON f.id_factura = r.id_factura
+                 LEFT JOIN tab_productos p ON p.producto = r.producto
+                 WHERE f.id_cliente = ? AND f.anulado = 'no'
+                 GROUP BY r.producto
+                 ORDER BY unidades DESC
+                 LIMIT 10`,
+                [c.id_cliente]
+            );
+            const [porMonto] = await pool.execute(
+                `SELECT r.producto, MAX(LEFT(p.descripcion, 80)) AS descripcion,
+                        SUM(r.cantidad) AS unidades, COUNT(DISTINCT f.id_factura) AS facturas,
+                        ROUND(SUM(r.precio_total), 2) AS monto
+                 FROM tab_facturas_reng r
+                 JOIN tab_facturas f ON f.id_factura = r.id_factura
+                 LEFT JOIN tab_productos p ON p.producto = r.producto
+                 WHERE f.id_cliente = ? AND f.anulado = 'no'
+                 GROUP BY r.producto
+                 ORDER BY monto DESC
+                 LIMIT 5`,
+                [c.id_cliente]
+            );
+            if (!porUnidades.length) {
+                await safeSendMessage(from, { text: `📭 *${c.nombres}* no tiene compras registradas en facturas no anuladas.` });
+                return true;
+            }
+            let msg = `🛒 *LO QUE MÁS HA COMPRADO ${c.nombres}*\n_Datos reales de facturas no anuladas._\n\n*Por unidades:*\n`;
+            porUnidades.forEach((p, i) => {
+                msg += `${i + 1}. *${p.producto}* — ${p.descripcion || ''}\n   *${p.unidades} und* · ${p.facturas} fact. · *$${formatoBs(p.monto)}*\n`;
+            });
+            msg += `\n*Por monto:*\n`;
+            porMonto.forEach((p, i) => {
+                msg += `${i + 1}. *${p.producto}* — ${p.descripcion || ''}\n   *$${formatoBs(p.monto)}* · ${p.unidades} und · ${p.facturas} fact.\n`;
+            });
+            await enviarTexto(from, msg.trim());
+            return true;
+        }
+
         // 1w) ¿Qué clientes compraron el producto X? / ventas del producto X
         const mCompra = t.match(/(?:qu[eé]|cu[aá]les|qui[eé]n(?:es)?)\s+(?:clientes?\s+)?(?:han?\s+)?(?:comprado|compraron|compr[oó]|compt[oó])\s+(?:el\s+)?(?:producto\s+)?(.+)/i)
             || t.match(/clientes?\s+que\s+(?:compraron|han\s+comprado)\s+(.+)/i)
