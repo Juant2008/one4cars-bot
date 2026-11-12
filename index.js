@@ -268,6 +268,87 @@ function normalizarTelAdmin(v) {
     if (!d.startsWith('58') && d.length === 10) d = '58' + d;
     return d;
 }   
+// ===== REGISTRO DE ADMINISTRADORES (teléfonos + alias @lid) =====
+const adminPhones = new Set();
+const adminJidsExtra = new Set();
+for (const id of ADMIN_IDS) {
+    const n = normalizarTelAdmin(id);
+    if (n) adminPhones.add(n);
+    adminJidsExtra.add(String(id));
+}
+
+/** ¿Este JID pertenece a un administrador? (teléfono, @lid o alias guardado) */
+function esAdminJid(jid) {
+    const s = String(jid || '').trim();
+    if (!s) return false;
+    const base = s.split('@')[0];
+    if (adminJidsExtra.has(s) || adminJidsExtra.has(base)) return true;
+    const d = normalizarTelAdmin(s);
+    if (d && adminPhones.has(d)) return true;
+    const diez = d.slice(-10);
+    if (diez.length === 10) {
+        for (const p of adminPhones) {
+            if (p.slice(-10) === diez) return true;
+        }
+    }
+    return false;
+}
+
+async function cargarAdmins() {
+    try {
+        await pool.execute(`CREATE TABLE IF NOT EXISTS bot_admins (
+            telefono VARCHAR(30) PRIMARY KEY,
+            nombre VARCHAR(120) DEFAULT NULL,
+            jids TEXT DEFAULT NULL,
+            activo VARCHAR(2) DEFAULT 'SI',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )`);
+        for (const id of ADMIN_IDS) {
+            const n = normalizarTelAdmin(id);
+            if (!n) continue;
+            adminPhones.add(n);
+            await pool.execute(
+                "INSERT IGNORE INTO bot_admins (telefono, jids) VALUES (?, ?)",
+                [n, JSON.stringify([String(id)])]
+            );
+        }
+        const [rows] = await pool.execute("SELECT telefono, jids FROM bot_admins WHERE activo = 'SI'");
+        for (const r of rows || []) {
+            const n = normalizarTelAdmin(r.telefono);
+            if (n) adminPhones.add(n);
+            let arr = [];
+            try { arr = JSON.parse(r.jids || '[]'); } catch (e) { arr = []; }
+            for (const j of arr) if (j) adminJidsExtra.add(String(j));
+        }
+        console.log(`[ADMIN] ${adminPhones.size} administrador(es) activos: ${[...adminPhones].join(', ')}`);
+    } catch (e) {
+        console.log('[ADMIN] No se pudo cargar el registro:', e.message);
+    }
+}
+
+/** Guarda el @lid desde el que escribe un administrador para reconocerlo siempre. */
+async function registrarAliasAdmin(jid, telefono) {
+    const j = String(jid || '').trim();
+    const tel = normalizarTelAdmin(telefono || '');
+    if (!j || !tel || !adminPhones.has(tel)) return;
+    if (adminJidsExtra.has(j)) return;
+    adminJidsExtra.add(j);
+    try {
+        const [rows] = await pool.execute("SELECT jids FROM bot_admins WHERE telefono = ?", [tel]);
+        let arr = [];
+        if (rows && rows[0]) { try { arr = JSON.parse(rows[0].jids || '[]'); } catch (e) { arr = []; } }
+        if (!arr.includes(j)) arr.push(j);
+        await pool.execute(
+            "INSERT INTO bot_admins (telefono, jids) VALUES (?, ?) ON DUPLICATE KEY UPDATE jids = ?",
+            [tel, JSON.stringify(arr), JSON.stringify(arr)]
+        );
+        console.log(`[ADMIN] Alias registrado: ${j} → ${tel}`);
+    } catch (e) {
+        console.log('[ADMIN] Error guardando alias:', e.message);
+    }
+}
+
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'one4cars.com',
     user: process.env.DB_USER || 'juant200_one4car',
@@ -281,6 +362,7 @@ const pool = mysql.createPool({
 catalogoTecnico.init(pool);
 reportesIA.init(pool);
 licencia.init(pool);
+cargarAdmins().catch(e => console.log('[ADMIN] Init:', e.message));
 aprendizaje.init(pool);
 rutas.init(pool);
 acciones.init(pool, {
@@ -751,11 +833,7 @@ const ultimoAvisoCerrado = new Map(); // jid -> timestamp del último aviso de c
 const ultimaPregunta = new Map();     // jid -> { texto, ts }
 
 function jidEsAdmin(jid) {
-    const d = String(jid || '').replace(/\D/g, '');
-    return ADMIN_IDS.some(id => {
-        const n = normalizarTelAdmin(id);
-        return String(jid || '').includes(id) || (n && d.includes(n));
-    });
+    return esAdminJid(jid);
 }
 
 function pausaPorLargo(texto) {
@@ -1632,6 +1710,40 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
     const t = String(rawText || '').trim();
     if (!t) return false;
     const tl = t.toLowerCase();
+    const tnAdmin = normalizar(t);
+    // 0) GESTIÓN DE ADMINISTRADORES (solo gerentes)
+    if (isAdmin && /^(administradores|admins|mis numeros|mis numeros admin)$/.test(tnAdmin)) {
+        try {
+            const [rows] = await pool.execute("SELECT telefono, nombre, jids, activo FROM bot_admins ORDER BY telefono");
+            let msg = `👑 *ADMINISTRADORES (${rows.length})*\n\n`;
+            rows.forEach((r, i) => {
+                msg += `${i + 1}. *${r.telefono}*${r.nombre ? ' — ' + r.nombre : ''} ${String(r.activo || 'SI').toUpperCase() === 'SI' ? '✅' : '⛔'}\n`;
+                let arr = [];
+                try { arr = JSON.parse(r.jids || '[]'); } catch (e) { arr = []; }
+                const extra = arr.filter(j => !String(j).includes(String(r.telefono)));
+                if (extra.length) msg += `   Alias: ${extra.join(', ')}\n`;
+            });
+            msg += `\n_Agregar: *agregar admin 04121234567*_`;
+            return await enviarTexto(from, msg.trim());
+        } catch (e) {
+            return await safeSendMessage(from, { text: `❌ Error: ${e.message}` });
+        }
+    }
+    if (isAdmin && /^agregar admin\s+/i.test(t)) {
+        const mAdm = t.match(/^agregar admin\s+([+\d\s-]{7,})/i);
+        const tel = normalizarTelAdmin(mAdm ? mAdm[1] : '');
+        if (!tel || tel.length < 11) {
+            return await safeSendMessage(from, { text: '❌ Número inválido. Ejemplo: *agregar admin 04121234567*' });
+        }
+        try {
+            await pool.execute("INSERT INTO bot_admins (telefono, activo) VALUES (?, 'SI') ON DUPLICATE KEY UPDATE activo = 'SI'", [tel]);
+            adminPhones.add(tel);
+            return await safeSendMessage(from, { text: `✅ *+${tel}* ahora es administrador.\n\nCuando escriba desde ese número, el bot le responderá como administrador (sin menús ni pausas).` });
+        } catch (e) {
+            return await safeSendMessage(from, { text: `❌ No pude agregarlo: ${e.message}` });
+        }
+    }
+
 
     // 1) Factura / Nota firmada (acepta "factura 6331", "nota 6331", "factura firmada 6331")
     const mNumFact = t.match(/(?:factura|nota)\s*(?:n[°ºo]?\.?\s*|#\s*|número\s*|nro\.?\s*)?(\d{2,6})\b/i);
@@ -2134,7 +2246,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
 
         // 1v) Record de pago / comportamiento de un cliente
-        const mRecord = t.match(/(?:record|historial|comportamiento|conducta)\s+(?:de\s+)?pago\s+(?:de|del)\s+(.+)/i)
+        const mRecord = t.match(/(?:record|historial|comportamiento|conducta)\s+(?:de\s+)?pagos?\s+(?:de|del|para)\s+(.+)/i)
             || t.match(/(?:c[oó]mo\s+paga|qu[eé]\s+tal\s+paga|c[oó]mo\s+se\s+comporta|c[oó]mo\s+es\s+(?:el\s+)?(?:cliente|pago))\s+(?:a|al|de|del)?\s*(.+)/i)
             || t.match(/(?:status|estatus)\s+(?:de|del)\s+(.+)/i);
         if (mRecord) {
@@ -2420,9 +2532,10 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             }
         }
 
-        // 1z01) ¿Cuál es el mejor cliente (global o de una zona)?
-        if (/(?:mejor(?:es)?|principal(?:es)?|m[aá]s\s+importante(?:s)?|top)\s+clientes?\b/i.test(t)
-            && !/producto|comprad|factur|ventas?|deud|cartera|vendedor|visitar/i.test(t)) {
+        // 1z01) Ranking de clientes destacados (global o de una zona)
+        const mDestacados = t.replace(/[?.!]+$/g, '').trim().match(/^clientes?\s+destacad[oa]s?(?:\s+(?:de\s+|del\s+|en\s+)?(.+))?$/i);
+        if (mDestacados || (/(?:mejor(?:es)?|principal(?:es)?|m[aá]s\s+importante(?:s)?|top)\s+clientes?\b/i.test(t)
+            && !/producto|comprad|factur|ventas?|deud|cartera|vendedor|visitar/i.test(t))) {
             try {
                 const candidatos = await calcularClientesVisita();
                 if (!candidatos.length) {
@@ -2430,7 +2543,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
                     return true;
                 }
                 const mZonaMejor = t.replace(/[?.!]+$/g, '').trim().match(/(?:de|del|en)\s+(?:la\s+)?(?:zona\s+)?([^?.!]+?)\s*$/i);
-                const termZona = mZonaMejor ? mZonaMejor[1].trim() : '';
+                const termZona = (mDestacados && mDestacados[1] ? mDestacados[1] : (mZonaMejor ? mZonaMejor[1] : '')).replace(/[?.!]+$/g, '').trim();
                 let lista = candidatos;
                 let titulo = 'CLIENTES DESTACADOS (GENERAL)';
                 if (termZona) {
@@ -3949,6 +4062,9 @@ async function ejecutarAccionRouter(decision, ctx) {
         case 'pedido':
             return await responderRouter(from, accion.respuesta || texto || '');
         case 'asesor': {
+            if (ctx.esAdmin) {
+                return await responderRouter(from, `🤖 No logré interpretar esa consulta.\n\nPrueba con:\n• *pedido estimado de CLIENTE*\n• *qué ha comprado CLIENTE*\n• *record de pago de CLIENTE*\n• *clientes destacados ZONA*\n• *zona con más potencial*\n• *plan de visitas por zona*\n• *estado de cuenta de CLIENTE*\n• *factura 6331*\n\nEscribe *comandos* para ver el menú completo.`);
+            }
             await responderRouter(from, accion.respuesta || texto || '');
             try {
                 const adminJids = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
@@ -4700,12 +4816,15 @@ async function startBot() {
                 }
             }
 
-            const isAdmin = ADMIN_IDS.some(id => {
-                const n = normalizarTelAdmin(id);
-                const fromDig = String(from || '').replace(/\D/g, '');
-                const pnDig = String((msg.key && (msg.key.senderPn || msg.key.remoteJidAlt)) || '').replace(/\D/g, '');
-                return String(from || '').includes(id) || fromDig.includes(n) || pnDig.includes(n);
-            });
+            const pnRaw = String((msg.key && (msg.key.senderPn || msg.key.remoteJidAlt)) || '').trim();
+            const pnDig = normalizarTelAdmin(pnRaw);
+            const isAdmin = esAdminJid(from) || (pnDig && adminPhones.has(pnDig)) || false;
+            if (isAdmin) {
+                // Un administrador siempre recibe respuesta: sin pausas, sin modo humano.
+                chatsSilenciados.delete(from);
+                if (pnDig && adminPhones.has(pnDig)) registrarAliasAdmin(from, pnDig).catch(() => {});
+                pool.execute("UPDATE control_chat SET modo='bot' WHERE telefono = ? AND modo <> 'bot'", [from]).catch(() => {});
+            }
             const vendedor = await buscarVendedor(from, msg.pushName || "Vendedor");
 
             if (!licencia.estaActiva() && !isAdmin) {
@@ -6444,6 +6563,11 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                 await guardarMensaje(from, 'model', respIA);
                 lastFallbackSent.set(from, ahora);
                 return await safeSendMessage(from, { text: respIA });
+            }
+
+            // --- 9.1b RESPALDO PARA ADMINISTRADORES (siempre responden) ---
+            if (isAdmin) {
+                return await safeSendMessage(from, { text: `🤖 No logré interpretar "*${String(rawText).slice(0, 70)}*".\n\nPrueba con:\n• *pedido estimado de CLIENTE*\n• *qué ha comprado CLIENTE*\n• *record de pago de CLIENTE*\n• *clientes destacados ZONA*\n• *zona con más potencial*\n• *plan de visitas por zona*\n• *estado de cuenta de CLIENTE*\n• *factura 6331*\n\nEscribe *comandos* para el menú completo.` });
             }
 
             // --- 9.2 RESPALDO CLÁSICO (si no hay saldo de DeepSeek o hubo error) ---
