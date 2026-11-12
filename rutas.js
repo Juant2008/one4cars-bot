@@ -194,7 +194,9 @@ async function textoClientesZona(term) {
                 COALESCE(p.nfact, 0) AS nfact,
                 COALESCE(p.dias, 0) AS dias,
                 u.ultima,
-                CASE WHEN u.ultima IS NULL THEN NULL ELSE DATEDIFF(CURDATE(), u.ultima) END AS dias_sin_comprar
+                CASE WHEN u.ultima IS NULL THEN NULL ELSE DATEDIFF(CURDATE(), u.ultima) END AS dias_sin_comprar,
+                COALESCE(v.comprado, 0) AS comprado,
+                COALESCE(v.ncompras, 0) AS ncompras
          FROM tab_clientes c
          LEFT JOIN (
              SELECT f.id_cliente,
@@ -210,6 +212,10 @@ async function textoClientesZona(term) {
              SELECT id_cliente, MAX(fecha_reg) AS ultima
              FROM tab_facturas WHERE anulado = 'no' GROUP BY id_cliente
          ) u ON u.id_cliente = c.id_cliente
+         LEFT JOIN (
+             SELECT id_cliente, SUM(total - abono_factura) AS comprado, COUNT(*) AS ncompras
+             FROM tab_facturas WHERE anulado = 'no' GROUP BY id_cliente
+         ) v ON v.id_cliente = c.id_cliente
          WHERE c.activo = 'SI' AND TRIM(c.zona) IN (${marcas})
          ORDER BY TRIM(c.zona) ASC,
                   COALESCE(p.dias, 0) DESC,
@@ -228,7 +234,15 @@ async function textoClientesZona(term) {
 
     let msg = `🗺️ *ZONA "${term.toUpperCase()}"*\n`;
     msg += `Zonas: ${zonas.join(' · ')}\n\n`;
-    msg += `• Clientes activos: *${clientes.length}*\n`;
+    let totalRegistrados = clientes.length;
+    try {
+        const [tot] = await poolRef.query(
+            `SELECT COUNT(*) AS n FROM tab_clientes WHERE TRIM(zona) IN (${marcas})`,
+            zonas
+        );
+        if (tot && tot[0] && Number(tot[0].n) > 0) totalRegistrados = Number(tot[0].n);
+    } catch (e) {}
+    msg += `• Clientes en la zona: *${totalRegistrados}* (activos: *${clientes.length}*)\n`;
     msg += `• 🔴 Con factura VENCIDA: *${conVencida.length}* → *$${money(totalVencido)}*\n`;
     msg += `• 🧾 Con factura NO vencida: *${conPendiente.length}* → *$${money(totalNoVencido)}* _(no visitar aún)_\n`;
     msg += `• ✅ Al día (compró y no debe): *${alDia.length}*\n`;
@@ -250,8 +264,11 @@ async function textoClientesZona(term) {
             let estado = '⚪ Sin compras';
             if (Number(c.vencido) > 0) estado = `🔴 *VENCIDA* $${money(c.vencido)} · ${c.dias}d`;
             else if (Number(c.pend) > 0) estado = `🧾 Factura $${money(c.pend)} · ${c.dias}d · *NO vencida* (no visitar aún)`;
-            else if (c.ultima) estado = `✅ Al día · últ. ${new Date(c.ultima).toLocaleDateString('es-VE')}`;
-            msg += `${i + 1}. ${c.nombres} — ${estado}`;
+            else if (c.ultima) estado = `✅ Al día`;
+            const compras = c.ultima
+                ? `$${money(c.comprado)} en ${c.ncompras} fact · últ. ${new Date(c.ultima).toLocaleDateString('es-VE')}`
+                : 'sin compras';
+            msg += `${i + 1}. ${c.nombres} — ${estado} · ${compras}`;
             if (c.celular) msg += ` · 📞 ${String(c.celular).trim()}`;
             msg += `\n`;
         });

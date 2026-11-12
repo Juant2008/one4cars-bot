@@ -2583,9 +2583,71 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             }
         }
 
+        // 1z0-) Clientes SIN COMPRAS (global o de una zona)
+        const mSinCompras = t.replace(/[?.!]+$/g, '').trim().match(/^(?:(?:dame|dime|muestrame|lista|listado|ver|busca|quiero)\s+(?:los\s+|las\s+|el\s+|la\s+)?|cuales\s+son\s+(?:los\s+|las\s+)?)?clientes?\s+(?:(?:que\s+)?(?:a[uú]n\s+)?no\s+(?:han\s+)?comprad[oa]s?|sin\s+compras?)(.*)$/i);
+        if (mSinCompras) {
+            try {
+                let zterm = String(mSinCompras[1] || '').trim();
+                for (let k = 0; k < 4; k++) {
+                    const antes = zterm;
+                    zterm = zterm.replace(/^\s*(?:en|de|del|la|el|los|las|zona|zonas)\s+/i, '').trim();
+                    if (zterm === antes) break;
+                }
+                let zonas = [];
+                if (zterm) {
+                    zonas = await rutas.buscarZonas(zterm, 30);
+                    if (!zonas.length) {
+                        await safeSendMessage(from, { text: `❌ No encontré una zona que coincida con "*${zterm}*".` });
+                        return true;
+                    }
+                }
+                const filtroZona = zonas.length ? ` AND TRIM(c.zona) IN (${zonas.map(() => '?').join(',')})` : '';
+                const [rows] = await pool.execute(
+                    `SELECT c.nombres, TRIM(c.zona) AS zona, c.celular, c.vendedor, c.fecha_reg
+                     FROM tab_clientes c
+                     LEFT JOIN (SELECT DISTINCT id_cliente FROM tab_facturas WHERE anulado = 'no') f ON f.id_cliente = c.id_cliente
+                     WHERE c.activo = 'SI' AND f.id_cliente IS NULL${filtroZona}
+                     ORDER BY TRIM(c.zona), c.nombres`,
+                    zonas
+                );
+                if (!rows.length) {
+                    await safeSendMessage(from, { text: `✅ No hay clientes activos sin compras${zonas.length ? ' en ' + zonas.join(' · ') : ''}.` });
+                    return true;
+                }
+                const porZona = new Map();
+                for (const r of rows) {
+                    const z = r.zona || 'SIN ZONA';
+                    if (!porZona.has(z)) porZona.set(z, []);
+                    porZona.get(z).push(r);
+                }
+                let msg = `🚫 *CLIENTES SIN COMPRAS${zonas.length ? ' — ' + zonas.join(' · ').toUpperCase() : ' (TODAS LAS ZONAS)'}*\n`;
+                msg += `_Total: *${rows.length}* cliente(s) activos sin ninguna factura._\n`;
+                msg += `_Zonas: ${porZona.size}_\n`;
+                for (const [zona, lista] of porZona) {
+                    msg += `\n*${zona}* (${lista.length})\n`;
+                    lista.forEach((c, i) => {
+                        msg += `${i + 1}. ${c.nombres}`;
+                        if (c.fecha_reg) {
+                            const fr = new Date(c.fecha_reg);
+                            if (!isNaN(fr)) msg += ` · registrado ${fr.toLocaleDateString('es-VE')}`;
+                        }
+                        if (c.celular) msg += ` · 📞 ${String(c.celular).trim()}`;
+                        msg += `\n`;
+                    });
+                }
+                msg += `\n_Para los que sí compran: *clientes ${zonas[0] || 'ZONA'}*_`;
+                await enviarTexto(from, msg.trim());
+                return true;
+            } catch (e) {
+                console.log('[SIN-COMPRAS] Error:', e.message);
+                await safeSendMessage(from, { text: `❌ No pude obtener la lista: ${e.message}` });
+                return true;
+            }
+        }
+
         // 1z0) Detalle de todos los clientes de una zona (por palabra)
         const tzZona = normalizar(t).replace(/['\u2019\u0060]/g, '');
-        const mZonaCli = tzZona.match(/^(?:(?:cuales|cual)\s+son\s+(?:los|las)\s+|(?:dame|dime|muestrame|lista|listado|ver|busca|quiero)\s+(?:los|las|el|la)?\s*(?:de\s+)?)?(?:zonas?|visitas?\s+(?:de|en|del)|clientes?\s+(?:de|en|del))\s+(?:la\s+)?(?:zona\s+)?(.+)/i);
+        const mZonaCli = tzZona.match(/^(?:(?:cuales|cual)\s+son\s+(?:los|las)\s+|(?:dame|dime|muestrame|lista|listado|ver|busca|quiero)\s+(?:los|las|el|la)?\s*(?:de\s+)?)?(?:zonas?|visitas?\s+(?:de|en|del)\s+|clientes?\s+(?!(?:que|sin|destacad|moros|vencid|a\s+visitar)\b)(?:(?:de|en|del)\s+)?)\s*(?:la\s+)?(?:zona\s+)?(.+)/i);
         if (mZonaCli) {
             const zterm = mZonaCli[1].replace(/[?.!]+$/g, '').trim();
             if (zterm) {
