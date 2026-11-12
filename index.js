@@ -1611,7 +1611,6 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             || t.match(/(?:qu[eé]\s+(?:le\s+)?(?:debo|deber[ií]a)\s+(?:pedir|sugerir|recomendar)|sugerir\s+pedido|sugiere\s+pedido|qu[eé]\s+le\s+vendo)\s+(?:a|para|de)\s+(.+)/i);
         if (mPedidoEst) {
             let term = mPedidoEst[1].replace(/[?.!]+$/g, '').trim();
-            // Quitar explicaciones y palabras genéricas: "... de avary, según el tiempo..."
             term = term.split(/[,;]/)[0].trim();
             term = term
                 .replace(/\b(?:seg[uú]n|de\s+acuerdo\s+con|basado\s+en|tomando\s+en\s+cuenta|considerando|con\s+base\s+en|en\s+funci[oó]n\s+de)\b[\s\S]*$/i, '')
@@ -1626,71 +1625,126 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             const c = clientes[0];
             const pct = await obtenerPorcentaje();
 
-            const [fechas] = await pool.execute(
+            const [facturasCli] = await pool.execute(
                 `SELECT fecha_reg FROM tab_facturas WHERE id_cliente = ? AND anulado = 'no' ORDER BY fecha_reg ASC`,
                 [c.id_cliente]
             );
-            if (!fechas.length) {
+            if (!facturasCli.length) {
                 await safeSendMessage(from, { text: `📭 *${c.nombres}* no tiene compras registradas para estimar un pedido.` });
                 return true;
             }
-            const primera = new Date(fechas[0].fecha_reg);
-            const ultima = new Date(fechas[fechas.length - 1].fecha_reg);
-            const numFact = fechas.length;
+            const numFact = facturasCli.length;
+            const primera = new Date(facturasCli[0].fecha_reg);
+            const ultima = new Date(facturasCli[numFact - 1].fecha_reg);
             const diasDesde = Math.max(0, Math.floor((Date.now() - ultima.getTime()) / 86400000));
             const intervaloCliente = numFact > 1
                 ? Math.max(15, Math.round((ultima - primera) / 86400000 / (numFact - 1)))
                 : 60;
-            const proximoEn = Math.max(0, intervaloCliente - diasDesde);
 
-            const [items] = await pool.execute(
+            const [pend] = await pool.execute(
+                `SELECT COUNT(*) AS n, COALESCE(SUM(total - abono_factura), 0) AS saldo,
+                        COALESCE(MAX(DATEDIFF(CURDATE(), fecha_reg)), 0) AS dias
+                 FROM tab_facturas WHERE id_cliente = ? AND pagada = 'NO' AND anulado = 'no'`,
+                [c.id_cliente]
+            );
+            const pendInfo = pend && pend[0] ? pend[0] : { n: 0, saldo: 0, dias: 0 };
+
+            const [rows] = await pool.execute(
                 `SELECT r.producto,
-                        MAX(LEFT(p.descripcion, 90)) AS descripcion,
-                        SUM(r.cantidad) AS cantidad,
+                        MAX(LEFT(p.descripcion, 85)) AS descripcion,
+                        SUM(r.cantidad) AS total,
+                        COUNT(DISTINCT f.id_factura) AS compras,
+                        AVG(r.cantidad) AS promedio,
+                        MAX(f.fecha_reg) AS ultima,
+                        MIN(f.fecha_reg) AS primera,
+                        DATEDIFF(CURDATE(), MAX(f.fecha_reg)) AS dias,
                         MAX(COALESCE(p.precio_minimo, 0)) AS precio,
                         MAX(COALESCE(p.cantidad_existencia,0) + COALESCE(p.cantidad_existencia_almacen,0)) AS stock
                  FROM tab_facturas_reng r
                  JOIN tab_facturas f ON f.id_factura = r.id_factura
                  LEFT JOIN tab_productos p ON p.producto = r.producto
-                 WHERE f.id_cliente = ? AND f.anulado = 'no' AND f.fecha_reg = ?
-                 GROUP BY r.producto`,
-                [c.id_cliente, fechas[fechas.length - 1].fecha_reg]
+                 WHERE f.id_cliente = ? AND f.anulado = 'no'
+                 GROUP BY r.producto
+                 ORDER BY dias ASC`,
+                [c.id_cliente]
             );
-            if (!items.length) {
-                await safeSendMessage(from, { text: `📭 *${c.nombres}* no tiene detalle de productos en su última factura.` });
+            if (!rows.length) {
+                await safeSendMessage(from, { text: `📭 *${c.nombres}* no tiene detalle de productos para estimar un pedido.` });
                 return true;
             }
 
-            let msg = `🧾 *PEDIDO ESTIMADO — ${c.nombres}*\n`;
-            msg += `_Último pedido: ${ultima.toLocaleDateString('es-VE')} (hace ${diasDesde} días). Ritmo habitual: ~${intervaloCliente} días entre pedidos._\n\n`;
+            const toca = [], proximos = [], unicas = [], alDia = [];
+            for (const r of rows) {
+                const compras = Number(r.compras) || 0;
+                const dias = Number(r.dias) || 0;
+                const promedio = Number(r.promedio) || 0;
+                const intervalo = compras > 1
+                    ? Math.max(5, Math.round((new Date(r.ultima) - new Date(r.primera)) / 86400000 / (compras - 1)))
+                    : null;
+                const item = {
+                    producto: r.producto,
+                    descripcion: r.descripcion || '',
+                    dias,
+                    intervalo,
+                    compras,
+                    cantidad: Math.max(1, Math.round(promedio)),
+                    precio: Number(r.precio) || 0,
+                    stock: Number(r.stock) || 0,
+                    ultima: r.ultima
+                };
+                if (compras === 1) {
+                    (dias >= 60 ? unicas : alDia).push(item);
+                } else if (dias >= intervalo) {
+                    item.prioridad = dias / intervalo;
+                    toca.push(item);
+                } else if (dias >= intervalo * 0.7) {
+                    item.falta = Math.max(1, Math.round(intervalo - dias));
+                    proximos.push(item);
+                } else {
+                    alDia.push(item);
+                }
+            }
+            toca.sort((a, b) => b.prioridad - a.prioridad);
+            proximos.sort((a, b) => a.falta - b.falta);
+            unicas.sort((a, b) => b.dias - a.dias);
 
-            if (proximoEn > 0) {
-                msg += `⏳ *Todavía no toca reponer.* Según su ritmo, el próximo pedido sería en ~*${proximoEn} días*.\n\n`;
-                msg += `*Referencia de su último pedido:*\n`;
-                items.slice(0, 12).forEach((p, i) => {
-                    msg += `${i + 1}. *${p.producto}* — ${String(p.descripcion || '').slice(0, 65)}\n   *${p.cantidad} und*\n`;
-                });
-                if (items.length > 12) msg += `… y ${items.length - 12} más.\n`;
-                msg += `\n_Cuando se acerque la fecha, el bot puede armar el pedido con estas cantidades._`;
-                await enviarTexto(from, msg.trim());
-                return true;
+            let msg = `🧾 *PEDIDO ESTIMADO — ${c.nombres}*\n`;
+            msg += `_Rotación basada en ${numFact} facturas históricas (no anuladas). Último pedido: ${ultima.toLocaleDateString('es-VE')} (hace ${diasDesde} días). Ritmo: ~${intervaloCliente} días._\n`;
+            if (Number(pendInfo.n) > 0) {
+                msg += `\n⚠️ *Factura pendiente:* ${pendInfo.n} por *$${formatoBs(pendInfo.saldo)}* (la más antigua con ${pendInfo.dias} días). Considere cobrar antes de despachar más.\n`;
             }
 
             let totalEstimado = 0;
-            msg += `✅ *Ya toca reponer* (han pasado ${diasDesde} días; su ritmo es ~${intervaloCliente}).\n\n*Pedido sugerido:*\n`;
-            items.slice(0, 20).forEach((p, i) => {
-                const cant = Math.max(1, Number(p.cantidad) || 1);
-                const precioUsd = Number(p.precio) > 0 ? (Number(p.precio) / (pct || 1)) : 0;
-                const subtotal = precioUsd * cant;
-                totalEstimado += subtotal;
-                msg += `${i + 1}. *${p.producto}* — ${String(p.descripcion || '').slice(0, 65)}\n   *${cant} und*`;
-                if (precioUsd > 0) msg += ` · $${formatoBs(subtotal)}`;
-                if (Number(p.stock) <= 0) msg += ` · ⚠️ sin stock`;
-                msg += `\n`;
-            });
-            if (items.length > 20) msg += `… y ${items.length - 20} más.\n`;
-            if (totalEstimado > 0) msg += `\n💰 *Total estimado: $${formatoBs(totalEstimado)}*`;
-            msg += `\n\n_Basado en las cantidades de su último pedido._`;
+            if (toca.length) {
+                msg += `\n🔴 *TOCA REPONER (${toca.length}):*\n`;
+                toca.forEach((p, i) => {
+                    const precioUsd = p.precio > 0 ? (p.precio / (pct || 1)) : 0;
+                    const subtotal = precioUsd * p.cantidad;
+                    totalEstimado += subtotal;
+                    msg += `${i + 1}. *${p.producto}* — ${p.descripcion.slice(0, 65)}\n`;
+                    msg += `   pide cada ~${p.intervalo}d · hace *${p.dias}d* · suele pedir *${p.cantidad} und*`;
+                    if (precioUsd > 0) msg += ` · $${formatoBs(subtotal)}`;
+                    if (p.stock <= 0) msg += ` · ⚠️ sin stock`;
+                    msg += `\n`;
+                });
+            } else {
+                msg += `\n✅ Ningún producto toca reponer por rotación todavía.\n`;
+            }
+            if (proximos.length) {
+                msg += `\n🟡 *PRÓXIMOS (${proximos.length}):*\n`;
+                proximos.forEach((p, i) => {
+                    msg += `${i + 1}. *${p.producto}* — en ~${p.falta}d · suele pedir *${p.cantidad} und* · ${p.descripcion.slice(0, 55)}\n`;
+                });
+            }
+            if (unicas.length) {
+                msg += `\n⚪ *COMPRA ÚNICA (${unicas.length}):*\n`;
+                unicas.forEach((p, i) => {
+                    msg += `${i + 1}. *${p.producto}* — ${p.descripcion.slice(0, 60)}\n   comprado una vez · hace ${p.dias}d · ${p.cantidad} und\n`;
+                });
+            }
+            msg += `\n✅ *AL DÍA:* ${alDia.length} producto(s) (incluye su último pedido).`;
+            if (totalEstimado > 0) msg += `\n\n💰 *Total estimado a reponer: $${formatoBs(totalEstimado)}*`;
+            msg += `\n\n_Puedes pedirme el detalle de cualquiera o convertirlo en pedido._`;
             await enviarTexto(from, msg.trim());
             return true;
         }
