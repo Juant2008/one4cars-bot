@@ -1393,7 +1393,7 @@ function linkReporteFactura(f) {
 /** Detecta preguntas analíticas que deben resolverse con SQL generado por IA. */
 function pareceConsultaAnalitica(raw) {
     const t = normalizar(raw);
-    if (/(factura|deuda|cartera|cobrar|cobranza|mora|vencid|saldo|vendi|venta|compras?|ranking|promedio|top\s*\d)/.test(t)) return true;
+    if (/(factura|deuda|cartera|cobrar|cobranza|mora|vencid|saldo|vendi|venta|compras?|comprad|compr[oó]|pedidos?|ha pedido|m[aá]s ha|ranking|promedio|top\s*\d)/.test(t)) return true;
     if (/(cuantos?|cuantas?|que cliente|cual cliente|quien|clientes con)/.test(t) &&
         /(debe|deben|compro|compraron|vendio|vendieron|factur)/.test(t)) return true;
     return false;
@@ -1782,8 +1782,8 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
 
         // 1w2) Consulta de producto rápida (admin, sin pasar por la IA)
-        if (/(?:^|\b)(cu[aá]l es|qu[eé] es|busco|b[uú]scame|tienes|tienen|hay|precio de|cu[aá]nto (?:cuesta|vale)|dame|mu[eé]strame)\b/i.test(t) &&
-            !/(estado de cuenta|factura|nota|cartera|record|status|tel[eé]fono|rif|zona|ruta|deuda|cliente|vendedor|cobrar|aniversario|visita)/i.test(t)) {
+        if (/(?:^|\b)(cu[aá]l es|busco|b[uú]scame|tienes|tienen|hay|precio de|cu[aá]nto (?:cuesta|vale)|dame|mu[eé]strame)\b/i.test(t) &&
+            !/(comprad|compr[oó]|pedido|ventas?|factur|historial|top|ranking|m[aá]s ha|ha pedido|estado de cuenta|factura|nota|cartera|record|status|tel[eé]fono|rif|zona|ruta|deuda|cliente|vendedor|cobrar|aniversario|visita)/i.test(t)) {
             let consultaProd = t
                 .replace(/^(?:hola[,\s]+|buenas[,\s]+|estimado[,\s]+)/i, '')
                 .replace(/^(?:cu[aá]l es|qu[eé] es|busco|b[uú]scame|precio de|cu[aá]nto (?:cuesta|vale)|dame|mu[eé]strame|tienes|tienen|hay)\s+/i, '')
