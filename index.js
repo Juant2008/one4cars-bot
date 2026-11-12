@@ -2375,9 +2375,104 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
             }
         }
 
+        // 1z00) ¿Cuál es la zona con más potencial / la mejor zona?
+        if (/(?:zonas?\s+(?:con\s+)?(?:m[aá]s\s+)?potencial|mejor(?:es)?\s+zonas?|zonas?\s+con\s+m[aá]s\s+(?:potencial|ventas?|clientes?|movimiento)|ranking\s+de\s+zonas|qu[eé]\s+zonas?\s+(?:tiene\s+m[aá]s|vende\s+m[aá]s|deja\s+m[aá]s|conviene))/i.test(t)
+            && !/plan\s+de\s+visitas?|visitas?\s+(?:por|en)\s+(?:las\s+)?zonas?/i.test(t)) {
+            try {
+                const candidatos = await calcularClientesVisita();
+                if (!candidatos.length) {
+                    await safeSendMessage(from, { text: 'No encontré clientes con historial para rankear las zonas.' });
+                    return true;
+                }
+                const mapa = new Map();
+                for (const c of candidatos) {
+                    const z = c.zona || 'SIN ZONA';
+                    if (!mapa.has(z)) mapa.set(z, { zona: z, clientes: 0, score: 0, comprado: 0, pendiente: 0, top: [] });
+                    const it = mapa.get(z);
+                    it.clientes += 1;
+                    it.score += c.score;
+                    it.comprado += c.comprado;
+                    it.pendiente += c.pendiente;
+                    it.top.push(c);
+                }
+                const zonas = [...mapa.values()].map(z => {
+                    z.top.sort((a, b) => b.score - a.score);
+                    return z;
+                }).sort((a, b) => b.score - a.score);
+
+                let msg = `🏆 *ZONAS CON MÁS POTENCIAL*\n_Criterios: compras, tiempo sin comprar y forma de pago._\n_${zonas.length} zona(s) · ${candidatos.length} clientes._\n`;
+                zonas.slice(0, 10).forEach((z, i) => {
+                    msg += `\n*${i + 1}. ${z.zona}* — ${z.clientes} cliente(s) · score ${z.score.toFixed(1)}\n`;
+                    msg += `   💰 Histórico $${formatoBs(z.comprado)}`;
+                    if (z.pendiente > 0) msg += ` · debe $${formatoBs(z.pendiente)}`;
+                    msg += `\n   ⭐ Mejor: *${z.top[0].nombres}* — score ${z.top[0].score} · hace ${z.top[0].dias}d · pago ${z.top[0].etiquetaPago}\n`;
+                });
+                if (zonas.length > 10) {
+                    msg += `\nHay ${zonas.length - 10} zona(s) más abajo. Pide *plan de visitas por zona* para el detalle.\n`;
+                }
+                msg += `\n_Para una zona específica: *ruta NOMBRE DE ZONA*_`;
+                await enviarTexto(from, msg.trim());
+                return true;
+            } catch (e) {
+                console.log('[ZONAS-POTENCIAL] Error:', e.message);
+                await safeSendMessage(from, { text: `❌ No pude calcular las zonas: ${e.message}` });
+                return true;
+            }
+        }
+
+        // 1z01) ¿Cuál es el mejor cliente (global o de una zona)?
+        if (/(?:mejor(?:es)?|principal(?:es)?|m[aá]s\s+importante(?:s)?|top)\s+clientes?\b/i.test(t)
+            && !/producto|comprad|factur|ventas?|deud|cartera|vendedor|visitar/i.test(t)) {
+            try {
+                const candidatos = await calcularClientesVisita();
+                if (!candidatos.length) {
+                    await safeSendMessage(from, { text: 'No encontré clientes con historial de compras.' });
+                    return true;
+                }
+                const mZonaMejor = t.replace(/[?.!]+$/g, '').trim().match(/(?:de|del|en)\s+(?:la\s+)?(?:zona\s+)?([^?.!]+?)\s*$/i);
+                const termZona = mZonaMejor ? mZonaMejor[1].trim() : '';
+                let lista = candidatos;
+                let titulo = 'CLIENTES DESTACADOS (GENERAL)';
+                if (termZona) {
+                    const zonas = await rutas.buscarZonas(termZona, 20);
+                    if (zonas.length) {
+                        const set = new Set(zonas.map(z => String(z).trim().toUpperCase()));
+                        lista = candidatos.filter(c => set.has(String(c.zona || '').trim().toUpperCase()));
+                        titulo = `CLIENTES DESTACADOS — ${zonas.join(' · ').toUpperCase()}`;
+                    } else {
+                        await safeSendMessage(from, { text: `❌ No encontré una zona que coincida con "*${termZona}*".` });
+                        return true;
+                    }
+                    if (!lista.length) {
+                        await safeSendMessage(from, { text: `No hay clientes con historial en *${termZona}*.` });
+                        return true;
+                    }
+                }
+                const limite = termZona ? 60 : 30;
+                const top = lista.slice(0, limite);
+                let msg = `🏆 *${titulo}*\n_Criterios: compras, tiempo sin comprar y forma de pago._\n_Ordenados del mejor al peor._\n\n`;
+                top.forEach((c, i) => {
+                    msg += `*${i + 1}. ${c.nombres}*${c.zona ? ' — ' + c.zona : ''}\n`;
+                    msg += `   🏆 Score: *${c.score}/100* · pago ${c.etiquetaPago} (${c.pagoScore}/100)\n`;
+                    msg += `   • Compró *$${formatoBs(c.comprado)}* en ${c.facturas} factura(s) · última hace *${c.dias}d*\n`;
+                    msg += `   • ${c.pendiente > 0 ? `Debe *$${formatoBs(c.pendiente)}*` : 'Sin deuda pendiente ✅'}\n`;
+                    if (c.celular) msg += `   📞 ${String(c.celular).trim()}\n`;
+                    msg += `\n`;
+                });
+                if (lista.length > top.length) msg += `_Mostrando los ${top.length} mejores de ${lista.length} con historial. Para el resto, pide *ruta ZONA* o *plan de visitas por zona*._\n`;
+                msg += `\n_Para su record de pago: *record de pago de NOMBRE*_`;
+                await enviarTexto(from, msg.trim());
+                return true;
+            } catch (e) {
+                console.log('[MEJOR-CLIENTE] Error:', e.message);
+                await safeSendMessage(from, { text: `❌ No pude calcular el mejor cliente: ${e.message}` });
+                return true;
+            }
+        }
+
         // 1z0) Detalle de todos los clientes de una zona (por palabra)
-        const mZonaCli = t.match(/^(?:zona|clientes?\s+(?:de|en|del))\s+(.+)/i)
-            || t.match(/^clientes?\s+de\s+la\s+zona\s+(.+)/i);
+        const tzZona = normalizar(t).replace(/['\u2019\u0060]/g, '');
+        const mZonaCli = tzZona.match(/^(?:(?:cuales|cual)\s+son\s+(?:los|las)\s+|(?:dame|dime|muestrame|lista|listado|ver|busca|quiero)\s+(?:los|las|el|la)?\s*(?:de\s+)?)?(?:zonas?|visitas?\s+(?:de|en|del)|clientes?\s+(?:de|en|del))\s+(?:la\s+)?(?:zona\s+)?(.+)/i);
         if (mZonaCli) {
             const zterm = mZonaCli[1].replace(/[?.!]+$/g, '').trim();
             if (zterm) {
@@ -2497,7 +2592,7 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         if (/\b(datos|todo|informaci[oó]n)\b/i.test(t)) campos.push('todo');
         const empiezaCampo = /^\s*(?:el\s+|la\s+|los\s+|las\s+)?(?:tel[eé]fono|celular|rif|c[eé]dula|direcci[oó]n|vendedor|zona|tipo|datos|todo)\b/i.test(t);
         const verboDatos = /^\s*(?:dame|dime|me\s+das|cu[aá]l\s+es|cu[aá]les\s+son|necesito|busca|consulta|pido|quiero\s+saber|sabes|tienes|ver)\b/i.test(t);
-        const esAnalitica = /producto|ventas?|comprad|compt|factura|vendid|deuda|cartera/i.test(t);
+        const esAnalitica = /producto|ventas?|comprad|compt|factura|vendid|deuda|cartera|potencial|mejor(?:es)?\s+(?:cliente|zona)|ranking|visitar/i.test(t);
         const pideDatos = campos.length > 0 && (empiezaCampo || (verboDatos && !esAnalitica));
 
         if (pideDatos) {
