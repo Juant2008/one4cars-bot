@@ -1162,6 +1162,23 @@ async function buscarVendedor(jid, pushName) {
     return null;
 }
 
+async function buscarVendedorPorRif(rif) {
+    const limpio = limpiarRIF(rif);
+    const digitos = soloNumerosRIF(rif);
+    if (!digitos || digitos.length < 5) return null;
+    try {
+        const [v] = await pool.execute(
+            `SELECT id_vendedor, nombre, celular_vendedor, clave, cedula_vendedor
+             FROM tab_vendedores
+             WHERE REPLACE(REPLACE(REPLACE(UPPER(COALESCE(clave,'')),' ',''),'-',''),'.','') IN (?, ?)
+                OR REPLACE(REPLACE(REPLACE(UPPER(COALESCE(cedula_vendedor,'')),' ',''),'-',''),'.','') IN (?, ?)
+             LIMIT 1`,
+            [limpio, digitos, limpio, digitos]
+        );
+        return (v && v[0]) || null;
+    } catch (e) { return null; }
+}
+
 function detectarIntencionMenu(texto) {
     if (!texto) return null;
     if (/^\d$/.test(texto)) {
@@ -3593,6 +3610,7 @@ async function getSesion(jid) {
 }
 
 async function guardarUsuario(jid, usuario, id_int) {
+    try { precioPermisoCache.delete(String(jid || '')); } catch (e) {}
     await pool.execute(`
         INSERT INTO control_chat (telefono, usuario, id_cliente_int, modo) 
         VALUES (?, ?, ?, 'bot') 
@@ -3885,12 +3903,15 @@ async function processMultiItemProduct(from, item, multiOrder) {
         return;
     }
     let msg = `🔍 *Producto ${multiOrder.currentIndex + 1} de ${multiOrder.items.length}:* "${item.descripcion}"\n(Cantidad: ${item.cantidad})\n\n`;
+    const permMulti = await puedeVerPrecios(from);
     prods.slice(0, 8).forEach((p, i) => {
         const precio = parseFloat(p.precio_minimo || 0) / pct;
         const stock = parseFloat(p.stock_total || 0);
         let estado = stock > 0 ? "✅" : (parseFloat(p.cantidad_fabricando || 0) > 0 ? "🚚" : "❌");
-        msg += `*${i+1}.* ${p.producto} — *$${precio.toFixed(2)}* ${estado}\n   ${p.descripcion.substring(0, 55)}${p.descripcion.length > 55 ? '...' : ''}\n`;
+        const precioTxt = permMulti.ok ? `*$${precio.toFixed(2)}*` : '🔒 *precio con RIF*';
+        msg += `*${i+1}.* ${p.producto} — ${precioTxt} ${estado}\n   ${p.descripcion.substring(0, 55)}${p.descripcion.length > 55 ? '...' : ''}\n`;
     });
+    if (!permMulti.ok) msg += `\n${TEXTO_PRECIO_REGISTRADO}\n`;
     msg += `\n📌 Responde el *número* del producto para este ítem.\n_O responde 0 para omitir_`;
     pendingProductSelection.set(from, { productos: prods.slice(0, 8), pct, multiItem: true });
     await safeSendMessage(from, { text: msg });
@@ -4052,8 +4073,43 @@ function notaCompat(prods) {
     return baja ? '\n\n⚠️ *Nota:* algunas referencias son compatibilidades referenciales. Un asesor confirma el calce exacto antes de comprar.' : '';
 }
 
+const precioPermisoCache = new Map();
+const TEXTO_PRECIO_REGISTRADO = '🔒 *Precios al mayor solo para clientes registrados.*\n\nEnv\u00ede su *RIF* (ejemplo J-123456789) y lo identifico al instante. Si a\u00fan no es cliente, reg\u00edstrese aqu\u00ed:\nhttps://www.one4cars.com/afiliar_clientes.php/';
+
+/** ¿Puede ver precios? Solo administradores, clientes de tab_clientes o vendedores de tab_vendedores. */
+async function puedeVerPrecios(from) {
+    const key = String(from || '');
+    const hit = precioPermisoCache.get(key);
+    if (hit && Date.now() - hit.ts < 10 * 60 * 1000) return hit;
+    let ok = false, tipo = null, nombre = null;
+    try {
+        if (esAdminJid(key)) { ok = true; tipo = 'admin'; }
+        if (!ok) {
+            const cli = await buscarClientePorTelefono(key.split('@')[0]);
+            if (cli) { ok = true; tipo = 'cliente'; nombre = cli.nombres; }
+        }
+        if (!ok) {
+            const v = await buscarVendedor(key, '');
+            if (v) { ok = true; tipo = 'vendedor'; nombre = v.nombre; }
+        }
+        if (!ok) {
+            // Vendedor identificado antes por RIF (aunque escriba desde otro número)
+            const [ses] = await pool.execute("SELECT usuario FROM control_chat WHERE telefono = ? LIMIT 1", [key]);
+            const u = ses && ses[0] && ses[0].usuario ? String(ses[0].usuario).trim() : '';
+            if (u && /[0-9]/.test(u)) {
+                const vv = await buscarVendedorPorRif(u);
+                if (vv) { ok = true; tipo = 'vendedor'; nombre = vv.nombre; }
+            }
+        }
+    } catch (e) {}
+    const res = { ok, tipo, nombre, ts: Date.now() };
+    precioPermisoCache.set(key, res);
+    if (precioPermisoCache.size > 500) precioPermisoCache.clear();
+    return res;
+}
+
 /** Redacta con IA una respuesta de catálogo usando SOLO los productos reales. */
-async function redactarProductosIA(consulta, lista, pct, soloIntro = false) {
+async function redactarProductosIA(consulta, lista, pct, soloIntro = false, verPrecio = true) {
     try {
         if (!proceActivo('ia') || !ia.estaHabilitada()) return null;
         if (!lista || !lista.length) return null;
@@ -4064,11 +4120,13 @@ async function redactarProductosIA(consulta, lista, pct, soloIntro = false) {
             const disp = stockN > 0
                 ? `disponible (${stockN} und)`
                 : (fab > 0 ? 'sin existencia, en tránsito desde fábrica' : 'disponibilidad a confirmar');
-            return `${i + 1}. Código ${p.producto} — ${String(p.descripcion || '').slice(0, 90)} — $${precio.toFixed(2)} — ${disp}`;
+            const lineaPrecio = verPrecio ? `$${precio.toFixed(2)}` : 'precio solo para clientes registrados';
+            return `${i + 1}. Código ${p.producto} — ${String(p.descripcion || '').slice(0, 90)} — ${lineaPrecio} — ${disp}`;
         }).join('\n');
+        const avisoPrecio = verPrecio ? '' : ' NO menciones ningún precio, monto ni descuento: indica que para ver precios al mayor debe validar su RIF.';
         const prompt = soloIntro
-            ? `El cliente escribió: "${consulta}".\n\nEstos son los productos REALES que le conseguimos (no inventes nada):\n${datos}\n\nRedacta SOLO una introducción breve (1 o 2 líneas, máximo 40 palabras), cálida y natural, diciendo cuántas opciones encontraste y lo más útil (marca, si hay disponible o no). No listes los productos, no repitas códigos ni precios.`
-            : `El cliente escribió: "${consulta}".\n\nEstos son productos REALES del inventario. Usa ÚNICAMENTE estos datos, no inventes ni cambies códigos, precios ni stock:\n${datos}\n\nRedacta una respuesta breve (máximo 80 palabras), cálida y natural, en español venezolano, presentando el producto con su código, precio en dólares y disponibilidad. No agregues enlaces ni datos que no estén aquí.`;
+            ? `El cliente escribió: "${consulta}".\n\nEstos son los productos REALES que le conseguimos (no inventes nada):\n${datos}\n\nRedacta SOLO una introducción breve (1 o 2 líneas, máximo 40 palabras), cálida y natural, diciendo cuántas opciones encontraste y lo más útil (marca, si hay disponible o no). No listes los productos, no repitas códigos ni precios.${avisoPrecio}`
+            : `El cliente escribió: "${consulta}".\n\nEstos son productos REALES del inventario. Usa ÚNICAMENTE estos datos, no inventes ni cambies códigos, precios ni stock:\n${datos}\n\nRedacta una respuesta breve (máximo 80 palabras), cálida y natural, en español venezolano, presentando el producto con su código, ${verPrecio ? 'precio en dólares y' : ''} disponibilidad. No agregues enlaces ni datos que no estén aquí.${avisoPrecio}`;
         const txt = await ia.preguntar(prompt, dolarInfo, { temperature: 0.35, max_tokens: 320 });
         return txt ? String(txt).trim() : null;
     } catch (e) {
@@ -4084,17 +4142,22 @@ async function enviarResultadosCompatibles(from, r) {
         return false;
     }
     const pct = await obtenerPorcentaje();
+    const perm = await puedeVerPrecios(from);
+    const verPrecio = perm.ok;
     if (prods.length > 1) {
-        const introIA = await redactarProductosIA(String(r.mensaje || 'consulta'), prods, pct, true);
+        const introIA = await redactarProductosIA(String(r.mensaje || 'consulta'), prods, pct, true, verPrecio);
         let msg = `${introIA || r.mensaje || '🔎 *Resultados compatibles*'}\n\n`;
         prods.slice(0, 8).forEach((p, i) => {
             const precio = parseFloat(p.precio_minimo || 0) / pct;
-            const precioTxt = precio > 0 ? `*$${precio.toFixed(2)}*` : '*Precio a confirmar*';
+            const precioTxt = verPrecio
+                ? (precio > 0 ? `*$${precio.toFixed(2)}*` : '*Precio a confirmar*')
+                : '🔒 *Precio con RIF*';
             msg += `*${i + 1}.* ${p.producto} — ${precioTxt} ${stockTexto(p)}\n   ${String(p.descripcion || '').slice(0, 80)}\n`;
         });
         if (r.mensaje && /ind[ií]queme|indique/i.test(r.mensaje)) msg += `\n${r.mensaje}`;
         msg += notaCompat(prods);
         msg += `\n\nResponda el *número* del producto que necesita.`;
+        if (!verPrecio) msg += `\n\n${TEXTO_PRECIO_REGISTRADO}`;
         pendingProductSelection.set(from, { productos: prods.slice(0, 8), pct });
         return await responderRouter(from, msg);
     }
@@ -4102,10 +4165,10 @@ async function enviarResultadosCompatibles(from, r) {
     const precio = parseFloat(p.precio_minimo || 0) / pct;
     const precioTxt = precio > 0 ? `$${precio.toFixed(2)}` : 'Precio a confirmar';
     const header = r.mensaje ? `${r.mensaje}\n\n` : '';
-    const redactado = await redactarProductosIA(String(r.mensaje || 'producto'), [p], pct, false);
+    const redactado = await redactarProductosIA(String(r.mensaje || 'producto'), [p], pct, false, verPrecio);
     const caption = redactado
-        ? `${header}${redactado}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}${notaCompat([p])}`
-        : `${header}📦 *${p.producto}*\n💰 *Precio: ${precioTxt}*${precio > 0 ? ' (pagadero a tasa BCV)' : ''}\n${stockTexto(p)}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}${notaCompat([p])}`;
+        ? `${header}${redactado}\n📝 ${p.descripcion}${verPrecio ? `\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}` : ''}${notaCompat([p])}${verPrecio ? '' : '\n\n' + TEXTO_PRECIO_REGISTRADO}`
+        : `${header}📦 *${p.producto}*\n💰 *Precio: ${verPrecio ? precioTxt : '🔒 solo con RIF'}*${verPrecio && precio > 0 ? ' (pagadero a tasa BCV)' : ''}\n${stockTexto(p)}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}${notaCompat([p])}${verPrecio ? '' : '\n\n' + TEXTO_PRECIO_REGISTRADO}`;
     try {
         if (!isBotReady()) throw new Error('socket no listo');
         registrarEnvioBot(from, caption);
@@ -4169,15 +4232,19 @@ async function responderProductosIA(from, busqueda) {
     }
     automatizaciones.registrarInteres(from, consulta);
     const pct = await obtenerPorcentaje();
+    const perm = await puedeVerPrecios(from);
+    const verPrecio = perm.ok;
     if (prods.length > 1) {
-        const introIA = await redactarProductosIA(consulta, prods, pct, true);
+        const introIA = await redactarProductosIA(consulta, prods, pct, true, verPrecio);
         let msg = `${introIA || `🔎 *Resultados para "${consulta.slice(0, 80)}"*`}\n\n`;
         prods.slice(0, 8).forEach((p, i) => {
             const precio = parseFloat(p.precio_minimo || 0) / pct;
             const desc = String(p.descripcion || '');
-            msg += `*${i + 1}.* ${p.producto} — *$${precio.toFixed(2)}*\n   ${desc.slice(0, 70)}${desc.length > 70 ? '...' : ''}\n`;
+            const precioTxt = verPrecio ? `*$${precio.toFixed(2)}*` : '🔒 *precio con RIF*';
+            msg += `*${i + 1}.* ${p.producto} — ${precioTxt}\n   ${desc.slice(0, 70)}${desc.length > 70 ? '...' : ''}\n`;
         });
         msg += `\nResponda el *número* del producto que necesita.`;
+        if (!verPrecio) msg += `\n\n${TEXTO_PRECIO_REGISTRADO}`;
         pendingProductSelection.set(from, { productos: prods.slice(0, 8), pct });
         return await responderRouter(from, msg);
     }
@@ -4190,10 +4257,11 @@ async function responderProductosIA(from, busqueda) {
     } else {
         stock = '\n✅ *Disponible*';
     }
-    const redactado = await redactarProductosIA(consulta, [p], pct, false);
+    const redactado = await redactarProductosIA(consulta, [p], pct, false, verPrecio);
+    const pie = verPrecio ? '' : '\n\n' + TEXTO_PRECIO_REGISTRADO;
     const caption = redactado
-        ? `${redactado}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`
-        : `📦 *${p.producto}*\n💰 *Precio: $${precio.toFixed(2)}* (pagadero a tasa BCV)${stock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`;
+        ? `${redactado}\n📝 ${p.descripcion}${verPrecio ? `\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}` : ''}${pie}`
+        : `📦 *${p.producto}*\n💰 *Precio: ${verPrecio ? `$${precio.toFixed(2)}* (pagadero a tasa BCV)` : '🔒 solo con RIF*'}${stock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}${pie}`;
     try {
         if (!isBotReady()) throw new Error('socket no listo');
         registrarEnvioBot(from, caption);
@@ -5703,6 +5771,12 @@ async function startBot() {
                         await guardarUsuario(from, rifLimpio, c.id_cliente);
                         return await safeSendMessage(from, { text: `✅ *RIF identificado.* Su empresa está registrada en ONE4CARS y ya puede comprar al mayor (mínimo USD 100).\n\n¿Qué producto o repuesto necesita? Puede indicarme pieza, marca, modelo y año del vehículo.` });
                     }
+                    const vendRif = await buscarVendedorPorRif(rifLimpio);
+                    if (vendRif) {
+                        await guardarUsuario(from, rifLimpio, 0);
+                        precioPermisoCache.delete(String(from));
+                        return await safeSendMessage(from, { text: `✅ *RIF identificado.* Bienvenido, *${vendRif.nombre}*.\n\nYa puede consultar precios al mayor y su cartera. ¿Qué necesita?` });
+                    }
                     await guardarLeadMayorista(from, 'RIF enviado', `RIF: ${rifLimpio}`);
                     await notificarLeadMayorista(from, 'RIF enviado', `RIF: ${rifLimpio}`);
                     return await safeSendMessage(from, { text: `No encontré el RIF *${rifLimpio}* en nuestra base de clientes.\n\n${TEXTO_REGISTRO_MAYORISTA}` });
@@ -5738,7 +5812,11 @@ async function startBot() {
                 if (idx >= 0 && idx < pendingSel.productos.length) {
                     const p = pendingSel.productos[idx];
                     const pct = pendingSel.pct;
+                    const permSel = await puedeVerPrecios(from);
                     pendingProductSelection.delete(from);
+                    if (!permSel.ok) {
+                        return await safeSendMessage(from, { text: TEXTO_PRECIO_REGISTRADO });
+                    }
                     const precio = parseFloat(p.precio_minimo || 0) / pct;
                     let infoStock = "";
                     if (parseFloat(p.stock_total || 0) <= 0) {
@@ -6669,12 +6747,15 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                         // Si múltiples resultados, presentar opciones
                         if (prods && prods.length > 1) {
                             const pct = await obtenerPorcentaje();
+                            const permProd = await puedeVerPrecios(from);
                             let msg = `🔍 *${prods.length} productos encontrados para:* "${textoBusqueda}"\n`;
                             prods.slice(0, 8).forEach((p, i) => {
                                 const precio = parseFloat(p.precio_minimo || 0) / pct;
-                                msg += `\n*${i+1}.* ${p.producto} — *$${precio.toFixed(2)}*\n   ${p.descripcion.substring(0, 60)}${p.descripcion.length > 60 ? '...' : ''}`;
+                                const precioTxt = permProd.ok ? `*$${precio.toFixed(2)}*` : '🔒 *precio con RIF*';
+                                msg += `\n*${i+1}.* ${p.producto} — ${precioTxt}\n   ${p.descripcion.substring(0, 60)}${p.descripcion.length > 60 ? '...' : ''}`;
                             });
                             msg += `\n\n📌 Responde el *número* del producto que necesitas.`;
+                            if (!permProd.ok) msg += `\n\n${TEXTO_PRECIO_REGISTRADO}`;
                             pendingProductSelection.set(from, { productos: prods.slice(0, 8), pct });
                             return await safeSendMessage(from, { text: msg });
                         }
@@ -6682,6 +6763,7 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
 
                     if (prods) {
                         const pct = await obtenerPorcentaje();
+                        const permProd = await puedeVerPrecios(from);
                         const saludoExacto = `¡Hola! He buscado en nuestro inventario y encontré esto:\n`;
                         await safeSendMessage(from, { text: saludoExacto });
                         await sleep(1000);
@@ -6702,7 +6784,7 @@ Mientras tanto, puede consultar el detalle de sus facturas pendientes aquí:
                                 infoStock = "\n✅ *Disponible*";
                             }
                             
-                            const caption = `📦 *CÓDIGO: ${p.producto}*\n💰 *Precio: $${precio.toFixed(2)} (Pagadero a tasa BCV)*${infoStock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`;
+                            const caption = `📦 *CÓDIGO: ${p.producto}*\n💰 *Precio: ${permProd.ok ? `$${precio.toFixed(2)} (Pagadero a tasa BCV)` : '🔒 solo con RIF'}*${infoStock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}${permProd.ok ? '' : '\n\n' + TEXTO_PRECIO_REGISTRADO}`;
                             const imgUrl = `https://one4cars.com/imagen/${p.producto}.jpg`;
                             try {
                                 registrarEnvioBot(from, caption); await socketBot.sendMessage(from, { image: { url: imgUrl }, caption: caption });
@@ -7931,6 +8013,7 @@ const server = http.createServer(async (req, res) => {
             }
             const texto = query.texto || '';
             const destino = formatWhatsApp(query.to || '584123715550');
+            const esAdminPrueba = String(query.admin || '1') !== '0';
             if (query.capturar === '1') {
                 const original = safeSendMessage;
                 const originalSocketSend = socketBot && socketBot.sendMessage ? socketBot.sendMessage.bind(socketBot) : null;
@@ -7941,7 +8024,7 @@ const server = http.createServer(async (req, res) => {
                 }
                 let manejado = false;
                 try {
-                    manejado = await atenderConsultaDueno(destino, texto, true);
+                    manejado = await atenderConsultaDueno(destino, texto, esAdminPrueba);
                 } finally {
                     safeSendMessage = original;
                     if (originalSocketSend) socketBot.sendMessage = originalSocketSend;
@@ -7949,7 +8032,7 @@ const server = http.createServer(async (req, res) => {
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
                 return res.end(JSON.stringify({ ok: true, texto, manejado, respuestas: capturado }, null, 2));
             }
-            const manejado = await atenderConsultaDueno(destino, texto, true);
+            const manejado = await atenderConsultaDueno(destino, texto, esAdminPrueba);
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: true, texto, manejado }, null, 2));
         } catch (e) {
@@ -7967,6 +8050,42 @@ const server = http.createServer(async (req, res) => {
             const ficha = cliente ? await fichaClienteRegistrado(cliente) : '';
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: true, tel, detectado: !!cliente, cliente, ficha }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-producto') {
+        try {
+            const txt = String(query.texto || '').trim();
+            const jid = formatWhatsApp(query.to || '584140000000');
+            const capturado = [];
+            const original = safeSendMessage;
+            const originalSocketSend = socketBot && socketBot.sendMessage ? socketBot.sendMessage.bind(socketBot) : null;
+            safeSendMessage = async (j, c) => { capturado.push(String((c && c.text) || '')); };
+            if (originalSocketSend) socketBot.sendMessage = async (j, c) => { capturado.push(String((c && (c.text || c.caption)) || '')); };
+            try {
+                await responderProductosIA(jid, txt);
+            } finally {
+                safeSendMessage = original;
+                if (originalSocketSend) socketBot.sendMessage = originalSocketSend;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, jid, textos: capturado }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-precios') {
+        try {
+            const tel = String(query.tel || query.telefono || '').replace(/\s/g, '');
+            if (!tel) {
+                res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'indique ?tel=58412...' }, null, 2));
+            }
+            const jid = tel.includes('@') ? tel : `${String(query.tel || tel).replace(/\D/g, '')}@s.whatsapp.net`;
+            const perm = await puedeVerPrecios(jid);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, jid, permiso: perm }, null, 2));
         } catch (e) {
             res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
