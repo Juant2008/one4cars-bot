@@ -843,7 +843,9 @@ function pausaPorLargo(texto) {
     return 6000 + Math.random() * 2500;
 }
 
+let sinPausasPrueba = false;
 async function pausaHumana(jid, texto) {
+    if (sinPausasPrueba) return;
     if (jidEsAdmin(jid)) return;
     try { if (socketBot && isBotReady()) await socketBot.sendPresenceUpdate('composing', jid); } catch (e) {}
     await new Promise(r => setTimeout(r, pausaPorLargo(texto)));
@@ -1143,9 +1145,20 @@ async function restaurarSesiones() {
 }
 
 async function buscarVendedor(jid, pushName) {
-    const telLimpio = jid.split('@')[0].replace(/\D/g, ''); 
+    const telLimpio = String(jid || '').split('@')[0].replace(/\D/g, '');
+    const diez = telLimpio.slice(-10);
+    const normV = (col) => `RIGHT(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${col},' ',''),'+',''),'-',''),'(',''),')',''),10)`;
+    try {
+        if (diez.length === 10) {
+            const [rv] = await pool.execute(
+                `SELECT * FROM tab_vendedores WHERE ${normV('celular_vendedor')} = ? OR ${normV('telefono_vendedor')} = ? LIMIT 1`,
+                [diez, diez]
+            );
+            if (rv && rv[0]) return rv[0];
+        }
+    } catch (e) {}
     const [r] = await pool.execute(
-        "SELECT * FROM tab_vendedores WHERE REPLACE(REPLACE(celular_vendedor, ' ', ''), '+', '') LIKE ? OR REPLACE(REPLACE(telefono_vendedor, ' ', ''), '+', '') LIKE ? LIMIT 1", 
+        "SELECT * FROM tab_vendedores WHERE REPLACE(REPLACE(celular_vendedor, ' ', ''), '+', '') LIKE ? OR REPLACE(REPLACE(telefono_vendedor, ' ', ''), '+', '') LIKE ? LIMIT 1",
         [`%${telLimpio}%`, `%${telLimpio}%`]
     );
     if (r[0]) return r[0];
@@ -1836,6 +1849,13 @@ async function atenderConsultaDueno(from, rawText, isAdmin) {
         }
     }
 
+
+    // 0b) Tasas del día (gerente)
+    if (isAdmin && /^(d[oó]lar|bcv|binance|paralelo|tasa|tasas|tasa del d[ií]a|cambio|cu[aá]nto est[aá] el d[oó]lar)\b/i.test(t)) {
+        try { await actualizarDolar(); } catch (e) {}
+        await safeSendMessage(from, { text: `💵 *TASAS DEL DÍA*\n\nBCV: *${dolarInfo.bcv} Bs./USD*\nParalelo: *${dolarInfo.paralelo} Bs./USD*\nBinance P2P: *${dolarInfo.binance} Bs./USD*\n\n_Tasas informativas, sujetas a variación._` });
+        return true;
+    }
 
     // 1) Factura / Nota firmada (acepta "factura 6331", "nota 6331", "factura firmada 6331")
     const mNumFact = t.match(/(?:factura|nota)\s*(?:n[°ºo]?\.?\s*|#\s*|número\s*|nro\.?\s*)?(\d{2,6})\b/i);
@@ -4293,11 +4313,57 @@ async function enviarReporteVisitasHoy(from) {
     }
 }
 
+async function textoCarteraVendedor(from) {
+    try {
+        const v = await buscarVendedor(from, '');
+        if (!v) return null;
+        const resumen = await resumenCarteraVendedor(v.id_vendedor);
+        let msg = `📊 *SU CARTERA — ${v.nombre}*\n\n• Clientes con deuda: *${resumen.clientes}*\n• Facturas pendientes: *${resumen.facturas}*\n• Total por cobrar: *$${formatoBs(resumen.saldo)}*\n`;
+        if (resumen.detalle.length) {
+            msg += `\n*Detalle (${resumen.detalle.length}):*\n`;
+            resumen.detalle.slice(0, 50).forEach((c, i) => { msg += `${i + 1}. ${c.nombres} — *$${formatoBs(c.saldo)}* (${c.dias}d)\n`; });
+        }
+        msg += `\n🔗 Panel: https://www.one4cars.com/mis_clientes.php/`;
+        return msg;
+    } catch (e) { return null; }
+}
+
+async function textoVentasVendedor(from) {
+    try {
+        const v = await buscarVendedor(from, '');
+        if (!v) return null;
+        const [hoy] = await pool.execute(
+            `SELECT COUNT(*) n, COALESCE(SUM(total), 0) t FROM tab_facturas
+             WHERE id_vendedor = ? AND anulado = 'no' AND DATE(fecha_reg) = CURDATE()`,
+            [v.id_vendedor]
+        );
+        const [mes] = await pool.execute(
+            `SELECT COUNT(*) n, COALESCE(SUM(total), 0) t FROM tab_facturas
+             WHERE id_vendedor = ? AND anulado = 'no' AND fecha_reg >= DATE_FORMAT(CURDATE(), '%Y-%m-01')`,
+            [v.id_vendedor]
+        );
+        const h = (hoy && hoy[0]) || { n: 0, t: 0 };
+        const m = (mes && mes[0]) || { n: 0, t: 0 };
+        return `📈 *SUS VENTAS — ${v.nombre}*\n\n• Hoy: *${h.n}* factura(s) · *$${formatoBs(h.t)}*\n• Mes en curso: *${m.n}* factura(s) · *$${formatoBs(m.t)}*\n\n_Escriba *cartera* para ver sus cobros pendientes._`;
+    } catch (e) { return null; }
+}
+
 async function ejecutarAccionRouter(decision, ctx) {
     const accion = accionCatalogo(decision.accion);
     if (!accion) return false;
     const from = ctx.from;
     const texto = String(decision.respuesta || '').trim();
+    if (ctx.vendedor && !ctx.esAdmin) {
+        const rv = String(ctx.rawText || '');
+        if (/cartera|mis clientes|mi zona|mi cartera/i.test(rv)) {
+            const tc = await textoCarteraVendedor(from);
+            if (tc) return await responderRouter(from, tc);
+        }
+        if (/cu[aá]nto\s+(vend[ií]|he\s+vendido|llevo)|mis ventas|ventas de hoy|cu[aá]nto he vendido/i.test(rv)) {
+            const tv = await textoVentasVendedor(from);
+            if (tv) return await responderRouter(from, tv);
+        }
+    }
     switch (accion.tipo) {
         case 'respuesta':
             return await responderRouter(from, accion.respuesta || texto);
@@ -4311,10 +4377,19 @@ async function ejecutarAccionRouter(decision, ctx) {
                 const manejado = await procesarRIFConsulta(from, rif, normalizar(rif));
                 if (manejado) return true;
             }
+            if (!clienteParam) {
+                const propio = await buscarClientePorTelefono(String(from).split('@')[0]);
+                if (propio) return await enviarEstadoCuentaCliente(from, propio.nombres);
+            }
             let termBusqueda = clienteParam || String(ctx.rawText || '')
                 .replace(/^(hola|buenas|buenos d[ií]as|estimado|por favor|dame|dime|cons[uú]ltame|consulta|mu[eé]strame|ver)\b[,\s]*/gi, '')
                 .replace(/^(el\s+)?estado\s+de\s+cuenta\s*(de|del|para)?\s*/gi, '')
                 .trim();
+            const esConsultaGenerica = /^(cu[aá]nto\s+(debo|debe|pagar|es)|mi\s+estado|estado\s+de\s+cuenta|saldo|deuda|mis\s+facturas?|cuenta)/i.test(termBusqueda);
+            if (esConsultaGenerica) {
+                pendienteFactura.set(from, { paso: 'rif' });
+                return await responderRouter(from, '🧾 Para consultar su estado de cuenta indíqueme su *RIF* (ejemplo J-123456789).');
+            }
             if (termBusqueda && termBusqueda.length >= 3 && !/^(sigue|ok|dale|por favor)$/i.test(termBusqueda)) {
                 await enviarEstadoCuentaCliente(from, termBusqueda);
                 return true;
@@ -4351,6 +4426,13 @@ async function ejecutarAccionRouter(decision, ctx) {
                 }
             } catch (e) {}
             return true;
+        }
+        case 'mis_clientes': {
+            if (ctx.vendedor) {
+                const tc = await textoCarteraVendedor(from);
+                if (tc) return await responderRouter(from, tc);
+            }
+            return await responderRouter(from, accion.respuesta || texto || '');
         }
         case 'visitas':
             if (!ctx.esAdmin) {
@@ -8050,6 +8132,55 @@ const server = http.createServer(async (req, res) => {
             const ficha = cliente ? await fichaClienteRegistrado(cliente) : '';
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: true, tel, detectado: !!cliente, cliente, ficha }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-simular') {
+        try {
+            const texto = String(query.texto || '').trim();
+            const tel = String(query.to || '584900000999').replace(/\D/g, '');
+            const jid = `${tel}@s.whatsapp.net`;
+            const rol = String(query.rol || '').toLowerCase();
+            const esAdminSim = rol === 'admin';
+            const vendedor = await buscarVendedor(jid, '');
+            const cliente = await buscarClientePorTelefono(tel);
+            const ctx = {
+                from: jid,
+                pushName: (cliente && cliente.nombres) || (vendedor && vendedor.nombre) || 'Cliente',
+                rawText: texto,
+                nombre: (cliente && cliente.nombres) || (vendedor && vendedor.nombre) || 'Cliente',
+                telefono: tel,
+                esAdmin: esAdminSim,
+                vendedor: vendedor ? vendedor.nombre : null,
+                sesionValidada: !!(cliente && cliente.id_cliente),
+                dolar: dolarInfo,
+                historial: []
+            };
+            const decision = await aiRouter.decidir(texto, ctx);
+            const capturado = [];
+            const original = safeSendMessage;
+            const originalSocketSend = socketBot && socketBot.sendMessage ? socketBot.sendMessage.bind(socketBot) : null;
+            safeSendMessage = async (j, c) => { capturado.push(String((c && c.text) || '')); };
+            if (originalSocketSend) socketBot.sendMessage = async (j, c) => { capturado.push(String((c && (c.text || c.caption)) || '')); };
+            sinPausasPrueba = true;
+            let manejado = false;
+            try {
+                manejado = await ejecutarAccionRouter(decision, ctx);
+            } finally {
+                sinPausasPrueba = false;
+                safeSendMessage = original;
+                if (originalSocketSend) socketBot.sendMessage = originalSocketSend;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                ok: true,
+                rol: esAdminSim ? 'admin' : (vendedor ? 'vendedor' : (cliente ? 'cliente' : 'no_registrado')),
+                reconocido: { cliente: cliente ? cliente.nombres : null, vendedor: vendedor ? vendedor.nombre : null },
+                decision,
+                manejado,
+                respuestas: capturado
+            }, null, 2));
         } catch (e) {
             res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
