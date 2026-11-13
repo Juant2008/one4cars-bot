@@ -126,10 +126,19 @@ async function encolar({ tipo, telefono, nombre = null, texto, prioridad = 5, re
     if (!telefono || !texto) return false;
     const tel = String(telefono).replace(/\s+/g, '').trim();
     if (!tel) return false;
+    // Teléfono inválido (ej. "580", vacío o menos de 10 dígitos) → no se encola
+    if (tel.replace(/\D/g, '').length < 10) {
+        console.log(`[COLA] Teléfono inválido para ${tipo}: "${tel}" (${nombre || 'sin nombre'})`);
+        return false;
+    }
     try {
+        const excluyentes = ['cobranza', 'estado_cuenta'];
+        const extra = excluyentes.includes(tipo) ? " OR tipo IN ('cobranza','estado_cuenta')" : '';
         const [dup] = await poolRef.query(
-            "SELECT 1 FROM bot_cola_envios WHERE tipo = ? AND telefono = ? AND estado = 'pendiente' LIMIT 1",
-            [tipo, tel]
+            `SELECT 1 FROM bot_cola_envios
+             WHERE telefono = ? AND estado = 'pendiente' AND (tipo = ?${extra})
+             LIMIT 1`,
+            [tel, tipo]
         );
         if (dup && dup.length) return false;
         await poolRef.query(

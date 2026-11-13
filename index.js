@@ -8136,6 +8136,110 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
         }
+    } else if (routename === '/test-masivo') {
+        try {
+            const accion = String(query.accion || 'deuda').toLowerCase();
+            const zona = String(query.zona || '').trim();
+            const diasDef = accion === 'fria' || accion === 'visita' ? 90 : (accion === 'estado' ? 30 : 50);
+            const dias = parseInt(query.dias || '0', 10) || diasDef;
+            const limite = Math.min(parseInt(query.limite || '60', 10) || 60, 200);
+            const muestra = Math.min(parseInt(query.muestra || '3', 10) || 3, 10);
+            const destinoPrueba = '584127021516@s.whatsapp.net';
+            const fZona = zona ? ` AND c.zona LIKE ?` : '';
+            const pZona = zona ? [`%${zona}%`] : [];
+            let rows = [];
+            let texto = (r) => '';
+            let titulo = '';
+
+            if (accion === 'deuda') {
+                titulo = `RECORDATORIO DE DEUDA (+${dias} días)`;
+                const [r] = await pool.execute(
+                    `SELECT c.id_cliente, c.nombres, c.celular, COUNT(*) AS facturas,
+                            ROUND(SUM(f.total - f.abono_factura), 2) AS saldo,
+                            MAX(DATEDIFF(CURDATE(), f.fecha_reg)) AS dias_max,
+                            SUBSTRING_INDEX(GROUP_CONCAT(f.nro_factura ORDER BY f.fecha_reg ASC), ',', 1) AS nro_antigua
+                     FROM tab_facturas f
+                     JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                     WHERE f.pagada = 'NO' AND f.anulado = 'no'
+                       AND DATEDIFF(CURDATE(), f.fecha_reg) >= ?
+                       AND c.celular <> ''${fZona}
+                     GROUP BY c.id_cliente ORDER BY saldo DESC LIMIT ?`,
+                    [dias, ...pZona, limite]
+                );
+                const excl = await automatizaciones.clientesExcluidosCobranza();
+                rows = (r || []).filter(x => !excl.has(Number(x.id_cliente)));
+                texto = (x) => `🧾 *FACTURA PENDIENTE — ONE4CARS*\n\nHola *${x.nombres}*, le informamos que mantiene una factura pendiente que debe pagar a la brevedad posible:\n\n• Factura N°: *${x.nro_antigua}*\n• Monto adeudado: *$${formatoBs(x.saldo)}*\n• Días de vencida: *${x.dias_max}*\n\n✍️ Factura firmada:\nhttps://www.one4cars.com/uploads/notas/${x.nro_antigua}.jpg\n\nSi ya realizó el pago, por favor comparta el comprobante por este chat. Gracias. 🚗`;
+            } else if (accion === 'estado') {
+                titulo = `ESTADO DE CUENTA (+${dias} días)`;
+                const [r] = await pool.execute(
+                    `SELECT c.id_cliente, c.nombres, c.celular, COUNT(*) facturas,
+                            ROUND(SUM(f.total - f.abono_factura), 2) saldo
+                     FROM tab_facturas f
+                     JOIN tab_clientes c ON c.id_cliente = f.id_cliente
+                     WHERE f.pagada='NO' AND f.anulado='no' AND c.celular<>''
+                       AND DATEDIFF(CURDATE(), f.fecha_reg) >= ?${fZona}
+                     GROUP BY c.id_cliente ORDER BY saldo DESC LIMIT ?`,
+                    [dias, ...pZona, limite]
+                );
+                rows = r || [];
+                texto = (x) => `📊 *ESTADO DE CUENTA*\n\nHola *${x.nombres}*, su saldo pendiente es *$${formatoBs(x.saldo)}* en *${x.facturas}* factura(s).\n\nLe agradecemos gestionar el pago. Estamos a su disposición. 🚗`;
+            } else if (accion === 'fria') {
+                titulo = `CAMPAÑA FRÍA (+${dias} días sin comprar)`;
+                const [r] = await pool.execute(
+                    `SELECT c.id_cliente, c.nombres, c.celular, u.ultima
+                     FROM tab_clientes c
+                     JOIN (SELECT id_cliente, MAX(fecha_reg) ultima FROM tab_facturas WHERE anulado='no' GROUP BY id_cliente) u ON u.id_cliente=c.id_cliente
+                     WHERE c.activo='SI' AND c.celular<>''
+                       AND u.ultima < DATE_SUB(CURDATE(), INTERVAL ? DAY)${fZona}
+                     ORDER BY u.ultima ASC LIMIT ?`,
+                    [dias, ...pZona, limite]
+                );
+                rows = r || [];
+                texto = (x) => `¡Buenos días, *${x.nombres}*! 👋\n\nLe escribe *ONE4CARS*. Hace tiempo que no tenemos el gusto de atenderle (su última compra fue el ${new Date(x.ultima).toLocaleDateString('es-VE')}).\n\n• Precios mayoristas vigentes\n• Nuevas llegadas de repuestos\n• Atención personalizada y despacho a su zona\n\n¿Hay algo en lo que podamos ayudarle hoy? 🚗`;
+            } else if (accion === 'visita') {
+                titulo = `RECORDATORIO DE VISITA (+${dias} días sin comprar)`;
+                const [r] = await pool.execute(
+                    `SELECT c.id_cliente, c.nombres, c.celular, u.ultima
+                     FROM tab_clientes c
+                     LEFT JOIN (SELECT id_cliente, MAX(fecha_reg) ultima FROM tab_facturas WHERE anulado='no' GROUP BY id_cliente) u ON u.id_cliente=c.id_cliente
+                     LEFT JOIN bot_visita15_log v ON v.id_cliente=c.id_cliente
+                     WHERE c.activo='SI' AND c.celular<>''
+                       AND (v.id_cliente IS NULL OR v.fecha_envio < DATE_SUB(NOW(), INTERVAL 15 DAY))
+                       AND (u.ultima IS NULL OR u.ultima < DATE_SUB(CURDATE(), INTERVAL ? DAY))${fZona}
+                     ORDER BY u.ultima ASC LIMIT ?`,
+                    [dias, ...pZona, limite]
+                );
+                rows = r || [];
+                texto = (x) => `👋 Hola *${x.nombres}*, le saluda su asesor de *ONE4CARS*. Queremos coordinar una visita para conocer sus necesidades actuales y mostrarle las novedades del catálogo. ¿Qué día le queda cómodo esta semana? 🚗`;
+            } else {
+                res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'accion inválida (deuda|estado|fria|visita)' }));
+            }
+
+            rows = (rows || []).filter(x => String(x.celular || '').replace(/\D/g, '').length >= 10);
+            const enviados = [];
+            for (const fila of rows.slice(0, muestra)) {
+                const t = texto(fila);
+                try {
+                    await safeSendMessage(destinoPrueba, { text: t });
+                    enviados.push({ nombre: fila.nombres, telefono: fila.celular });
+                } catch (e) {}
+                await new Promise(r => setTimeout(r, 1200));
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                ok: true,
+                accion, dias, zona: zona || null,
+                total: rows.length,
+                muestra_enviada_a: destinoPrueba,
+                enviados,
+                destinatarios: rows.map(x => ({ nombre: x.nombres, telefono: x.celular, saldo: x.saldo || null, dias: x.dias_max || null, ultima: x.ultima || null })),
+                ejemplo_texto: rows.length ? texto(rows[0]) : ''
+            }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
     } else if (routename === '/test-simular') {
         try {
             const texto = String(query.texto || '').trim();
