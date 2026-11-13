@@ -158,6 +158,10 @@ async function siguiente() {
         const ultimoPorTipo = new Map();
         for (const u of (ultimos || [])) ultimoPorTipo.set(u.tipo, new Date(u.ult).getTime() || 0);
         let tipos = (pend || []).map(p => p.tipo);
+        // "Estado de cuenta" masivo: SOLO de lunes a viernes.
+        const { diaSemana } = ahoraCaracas();
+        if (diaSemana === 0 || diaSemana === 6) tipos = tipos.filter(t => t !== 'estado_cuenta');
+        if (!tipos.length) return null;
         if (tipos.length > 1 && ultimoTipo) tipos = tipos.filter(t => t !== ultimoTipo);
         tipos.sort((a, b) => (ultimoPorTipo.get(a) || 0) - (ultimoPorTipo.get(b) || 0));
         const tipo = tipos[0];

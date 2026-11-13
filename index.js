@@ -3049,11 +3049,29 @@ async function detectarReencuentroMaster(from) {
         const seg = r[0] && r[0].seg;
         if (seg === null || seg === undefined || Number(seg) < REENCUENTRO_HORAS * 3600) return null;
         const [msgs] = await pool.execute(
-            "SELECT contenido FROM historial_chat WHERE telefono = ? AND rol = 'user' ORDER BY id DESC LIMIT 6",
+            "SELECT rol, contenido FROM historial_chat WHERE telefono = ? ORDER BY id DESC LIMIT 16",
             [from]
         );
-        const resumen = msgs.reverse().map(m => String(m.contenido || '').trim()).filter(Boolean).join(' | ').slice(0, 220);
-        return { seg: Number(seg), fecha: r[0].fecha, resumen };
+        const lista = (msgs || [])
+            .reverse()
+            .map(m => ({ rol: m.rol, texto: String(m.contenido || '').replace(/\s+/g, ' ').trim() }))
+            .filter(m => m.texto && !/^(si|no|ok|dale|gracias|menu|menú)$/i.test(m.texto) && !/^\d+$/.test(m.texto));
+        const convo = lista.slice(-10).map(m => `${m.rol === 'user' ? 'Cliente' : 'Bot'}: ${m.texto.slice(0, 160)}`).join('\n');
+        const resumen = lista.filter(m => m.rol === 'user').slice(-3).map(m => m.texto.slice(0, 80)).join(' | ').slice(0, 220);
+        return { seg: Number(seg), fecha: r[0].fecha, resumen, convo, mensajes: lista.length };
+    } catch (e) { return null; }
+}
+
+/** Resume con IA la conversación anterior para el saludo de reencuentro. */
+async function resumenReencuentroIA(convo, nombre) {
+    try {
+        if (!proceActivo('ia') || !ia.estaHabilitada() || !convo) return null;
+        const txt = await ia.preguntar(
+            `Este es el final de la conversación anterior con el cliente ${nombre || ''}:\n${convo}\n\nResume en UNA sola frase corta (máximo 20 palabras) qué necesitaba o en qué quedó el tema, en tercera persona. No inventes nada.`,
+            dolarInfo,
+            { temperature: 0.3, max_tokens: 90 }
+        );
+        return txt ? String(txt).replace(/\s+/g, ' ').trim().slice(0, 180) : null;
     } catch (e) { return null; }
 }
 
@@ -4034,6 +4052,31 @@ function notaCompat(prods) {
     return baja ? '\n\n⚠️ *Nota:* algunas referencias son compatibilidades referenciales. Un asesor confirma el calce exacto antes de comprar.' : '';
 }
 
+/** Redacta con IA una respuesta de catálogo usando SOLO los productos reales. */
+async function redactarProductosIA(consulta, lista, pct, soloIntro = false) {
+    try {
+        if (!proceActivo('ia') || !ia.estaHabilitada()) return null;
+        if (!lista || !lista.length) return null;
+        const datos = lista.slice(0, 6).map((p, i) => {
+            const precio = parseFloat(p.precio_minimo || 0) / (pct || 1);
+            const stockN = parseFloat(p.stock_total || 0);
+            const fab = parseFloat(p.cantidad_fabricando || 0);
+            const disp = stockN > 0
+                ? `disponible (${stockN} und)`
+                : (fab > 0 ? 'sin existencia, en tránsito desde fábrica' : 'disponibilidad a confirmar');
+            return `${i + 1}. Código ${p.producto} — ${String(p.descripcion || '').slice(0, 90)} — $${precio.toFixed(2)} — ${disp}`;
+        }).join('\n');
+        const prompt = soloIntro
+            ? `El cliente escribió: "${consulta}".\n\nEstos son los productos REALES que le conseguimos (no inventes nada):\n${datos}\n\nRedacta SOLO una introducción breve (1 o 2 líneas, máximo 40 palabras), cálida y natural, diciendo cuántas opciones encontraste y lo más útil (marca, si hay disponible o no). No listes los productos, no repitas códigos ni precios.`
+            : `El cliente escribió: "${consulta}".\n\nEstos son productos REALES del inventario. Usa ÚNICAMENTE estos datos, no inventes ni cambies códigos, precios ni stock:\n${datos}\n\nRedacta una respuesta breve (máximo 80 palabras), cálida y natural, en español venezolano, presentando el producto con su código, precio en dólares y disponibilidad. No agregues enlaces ni datos que no estén aquí.`;
+        const txt = await ia.preguntar(prompt, dolarInfo, { temperature: 0.35, max_tokens: 320 });
+        return txt ? String(txt).trim() : null;
+    } catch (e) {
+        console.log('[CATALOGO] IA redacción:', e.message);
+        return null;
+    }
+}
+
 async function enviarResultadosCompatibles(from, r) {
     const prods = (r && r.productos) ? r.productos : [];
     if (!prods.length) {
@@ -4042,7 +4085,8 @@ async function enviarResultadosCompatibles(from, r) {
     }
     const pct = await obtenerPorcentaje();
     if (prods.length > 1) {
-        let msg = `${r.mensaje || '🔎 *Resultados compatibles*'}\n\n`;
+        const introIA = await redactarProductosIA(String(r.mensaje || 'consulta'), prods, pct, true);
+        let msg = `${introIA || r.mensaje || '🔎 *Resultados compatibles*'}\n\n`;
         prods.slice(0, 8).forEach((p, i) => {
             const precio = parseFloat(p.precio_minimo || 0) / pct;
             const precioTxt = precio > 0 ? `*$${precio.toFixed(2)}*` : '*Precio a confirmar*';
@@ -4058,7 +4102,10 @@ async function enviarResultadosCompatibles(from, r) {
     const precio = parseFloat(p.precio_minimo || 0) / pct;
     const precioTxt = precio > 0 ? `$${precio.toFixed(2)}` : 'Precio a confirmar';
     const header = r.mensaje ? `${r.mensaje}\n\n` : '';
-    const caption = `${header}📦 *${p.producto}*\n💰 *Precio: ${precioTxt}*${precio > 0 ? ' (pagadero a tasa BCV)' : ''}\n${stockTexto(p)}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}${notaCompat([p])}`;
+    const redactado = await redactarProductosIA(String(r.mensaje || 'producto'), [p], pct, false);
+    const caption = redactado
+        ? `${header}${redactado}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}${notaCompat([p])}`
+        : `${header}📦 *${p.producto}*\n💰 *Precio: ${precioTxt}*${precio > 0 ? ' (pagadero a tasa BCV)' : ''}\n${stockTexto(p)}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo || '')}${notaCompat([p])}`;
     try {
         if (!isBotReady()) throw new Error('socket no listo');
         registrarEnvioBot(from, caption);
@@ -4076,10 +4123,20 @@ async function responderProductosIA(from, busqueda) {
         return await responderRouter(from, '🔎 Indíqueme la pieza que busca y, si aplica, marca, modelo y año del vehículo. Así puedo confirmar precio y disponibilidad.');
     }
     let prods = null;
-    // 1) Código OEM / equivalencia
+    // 1) Código OEM / equivalencia (SIEMPRE primero, antes de la búsqueda por texto)
     try {
-        const oem = await catalogoTecnico.buscarPorOEM(consulta);
+        let oem = await catalogoTecnico.buscarPorOEM(consulta);
+        if (!oem || !oem.productos || !oem.productos.length) {
+            // El código puede venir dentro de una frase larga: probar token por token.
+            const tokens = (consulta.match(/[A-Za-z0-9][A-Za-z0-9._\/-]{3,}/g) || []).slice(0, 8);
+            for (const tk of tokens) {
+                if (!/\d/.test(tk)) continue;
+                const o2 = await catalogoTecnico.buscarPorOEM(tk);
+                if (o2 && o2.productos && o2.productos.length) { oem = o2; break; }
+            }
+        }
         if (oem && oem.productos && oem.productos.length) {
+            console.log(`[CATALOGO] OEM hit: ${oem.codigos.join(', ')} → ${oem.productos.length} producto(s)`);
             automatizaciones.registrarInteres(from, consulta);
             return await enviarResultadosCompatibles(from, {
                 productos: oem.productos,
@@ -4113,7 +4170,8 @@ async function responderProductosIA(from, busqueda) {
     automatizaciones.registrarInteres(from, consulta);
     const pct = await obtenerPorcentaje();
     if (prods.length > 1) {
-        let msg = `🔎 *Resultados para "${consulta.slice(0, 80)}"*\n\n`;
+        const introIA = await redactarProductosIA(consulta, prods, pct, true);
+        let msg = `${introIA || `🔎 *Resultados para "${consulta.slice(0, 80)}"*`}\n\n`;
         prods.slice(0, 8).forEach((p, i) => {
             const precio = parseFloat(p.precio_minimo || 0) / pct;
             const desc = String(p.descripcion || '');
@@ -4132,7 +4190,10 @@ async function responderProductosIA(from, busqueda) {
     } else {
         stock = '\n✅ *Disponible*';
     }
-    const caption = `📦 *${p.producto}*\n💰 *Precio: $${precio.toFixed(2)}* (pagadero a tasa BCV)${stock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`;
+    const redactado = await redactarProductosIA(consulta, [p], pct, false);
+    const caption = redactado
+        ? `${redactado}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`
+        : `📦 *${p.producto}*\n💰 *Precio: $${precio.toFixed(2)}* (pagadero a tasa BCV)${stock}\n📝 ${p.descripcion}\n🔗 Ficha: https://one4cars.com/producto_general.php?cod=${p.producto}&tipo=${encodeURIComponent(p.tipo)}`;
     try {
         if (!isBotReady()) throw new Error('socket no listo');
         registrarEnvioBot(from, caption);
@@ -5715,12 +5776,14 @@ async function startBot() {
             if (!isAdmin && !esSaludoTexto && !/^\d+$/.test(text)) {
                 const reenc = await detectarReencuentroMaster(from);
                 if (reenc) {
-                    const nombreReenc = nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || 'estimado';
+                    const nombreReenc = (clienteRegistrado && clienteRegistrado.nombres) || nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || 'estimado';
                     let fechaReenc = '';
                     try {
                         fechaReenc = new Date(reenc.fecha).toLocaleDateString('es-VE', { timeZone: 'America/Caracas', day: '2-digit', month: '2-digit', year: 'numeric' });
                     } catch (e) { fechaReenc = ''; }
-                    const resumenReenc = reenc.resumen ? ` y hablamos de: ${reenc.resumen}` : '';
+                    let resumenReenc = reenc.resumen ? ` y hablamos de: ${reenc.resumen}` : '';
+                    const iaResumen = await resumenReencuentroIA(reenc.convo, nombreReenc);
+                    if (iaResumen) resumenReenc = ` y quedamos en: ${iaResumen}`;
                     const msgReenc = `👋 Hola de nuevo, *${nombreReenc}*. La última vez que conversamos fue el ${fechaReenc}${resumenReenc}. ¿Cómo le fue?`;
                     await safeSendMessage(from, { text: msgReenc });
                     try { await guardarMensaje(from, 'model', msgReenc); } catch (e) {}
@@ -7870,13 +7933,18 @@ const server = http.createServer(async (req, res) => {
             const destino = formatWhatsApp(query.to || '584123715550');
             if (query.capturar === '1') {
                 const original = safeSendMessage;
+                const originalSocketSend = socketBot && socketBot.sendMessage ? socketBot.sendMessage.bind(socketBot) : null;
                 const capturado = [];
                 safeSendMessage = async (jid, content) => { capturado.push(String((content && content.text) || '')); };
+                if (originalSocketSend) {
+                    socketBot.sendMessage = async (jid, content) => { capturado.push(String((content && (content.text || content.caption)) || '')); };
+                }
                 let manejado = false;
                 try {
                     manejado = await atenderConsultaDueno(destino, texto, true);
                 } finally {
                     safeSendMessage = original;
+                    if (originalSocketSend) socketBot.sendMessage = originalSocketSend;
                 }
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
                 return res.end(JSON.stringify({ ok: true, texto, manejado, respuestas: capturado }, null, 2));

@@ -116,7 +116,7 @@ async function verificarSaldo() {
 }
 
 // Llama a deepseek-chat. Devuelve el texto de respuesta o null si falla.
-async function preguntar(mensaje, dolarInfo) {
+async function preguntar(mensaje, dolarInfo, opciones = {}) {
     if (!iaHabilitada) return null;
     if (!API_KEY) {
         iaHabilitada = false;
@@ -131,8 +131,8 @@ async function preguntar(mensaje, dolarInfo) {
                 { role: 'system', content: construirPrompt(dolarInfo) },
                 { role: 'user', content: mensaje }
             ],
-            max_tokens: 400,
-            temperature: 0.7
+            max_tokens: Number(opciones.max_tokens) || 400,
+            temperature: typeof opciones.temperature === 'number' ? opciones.temperature : 0.7
         }, {
             headers: {
                 'Authorization': `Bearer ${API_KEY}`,
