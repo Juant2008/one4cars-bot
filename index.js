@@ -1326,14 +1326,62 @@ async function guardarVisita(from, datos) {
 }
 
 async function buscarClientePorTelefono(tel) {
-    const telLimpio = tel.replace(/\D/g, '');
+    const telLimpio = String(tel || '').replace(/\D/g, '');
+    if (!telLimpio) return null;
+    const diez = telLimpio.slice(-10);
+    const norm = (col) => `RIGHT(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${col},' ',''),'-',''),'+',''),'.',''),'(',''),')',''),10)`;
     try {
         const [r] = await pool.execute(
-            "SELECT id_cliente, nombres, cedula, celular, telefono, direccion, zona, clave as rif, vendedor FROM tab_clientes WHERE REPLACE(celular, ' ', '') LIKE ? OR REPLACE(telefono, ' ', '') LIKE ? LIMIT 1",
+            `SELECT id_cliente, nombres, cedula, celular, telefono, direccion, zona, clave as rif, vendedor, tipo
+             FROM tab_clientes
+             WHERE ${norm('celular')} = ? OR ${norm('telefono')} = ?
+             LIMIT 1`,
+            [diez, diez]
+        );
+        if (r && r[0]) return r[0];
+        // Respaldo: coincidencia parcial (solo con números suficientemente largos)
+        if (telLimpio.length < 8) return null;
+        const [r2] = await pool.execute(
+            "SELECT id_cliente, nombres, cedula, celular, telefono, direccion, zona, clave as rif, vendedor, tipo FROM tab_clientes WHERE REPLACE(celular, ' ', '') LIKE ? OR REPLACE(telefono, ' ', '') LIKE ? LIMIT 1",
             [`%${telLimpio}%`, `%${telLimpio}%`]
         );
-        return r[0] || null;
+        return (r2 && r2[0]) || null;
     } catch (e) { return null; }
+}
+
+/** Ficha breve de un cliente registrado: zona, vendedor, saldo y última compra. */
+async function fichaClienteRegistrado(c) {
+    try {
+        const [pend] = await pool.execute(
+            `SELECT COUNT(*) AS n, COALESCE(SUM(total - abono_factura), 0) AS saldo,
+                    COALESCE(MAX(DATEDIFF(CURDATE(), fecha_reg)), 0) AS dias
+             FROM tab_facturas WHERE id_cliente = ? AND pagada = 'NO' AND anulado = 'no'`,
+            [c.id_cliente]
+        );
+        const [hist] = await pool.execute(
+            `SELECT COUNT(*) AS n, MAX(fecha_reg) AS ultima
+             FROM tab_facturas WHERE id_cliente = ? AND anulado = 'no'`,
+            [c.id_cliente]
+        );
+        const p = (pend && pend[0]) || {};
+        const h = (hist && hist[0]) || {};
+        let m = `\n\n🏢 *${c.nombres}*`;
+        const linea = [];
+        if (c.zona) linea.push(`📍 ${String(c.zona).trim()}`);
+        if (c.vendedor) linea.push(`🧑‍💼 ${c.vendedor}`);
+        if (linea.length) m += `\n${linea.join(' · ')}`;
+        if (Number(p.n) > 0) {
+            m += `\n💰 Saldo pendiente: *$${formatoBs(p.saldo)}* (${p.n} factura${Number(p.n) === 1 ? '' : 's'} · la más antigua ${p.dias}d)`;
+        } else {
+            m += `\n✅ Sin facturas pendientes`;
+        }
+        if (h.ultima) {
+            m += `\n🛒 Última compra: ${new Date(h.ultima).toLocaleDateString('es-VE')} · ${h.n} factura(s) en total`;
+        } else {
+            m += `\n🛒 Aún sin compras registradas`;
+        }
+        return m;
+    } catch (e) { return ''; }
 }
 
 // ===== CONSULTAS RÁPIDAS (DUEÑO / ADMIN) =====
@@ -5095,6 +5143,27 @@ async function startBot() {
                 }
             }
 
+            // --- CLIENTE REGISTRADO: identificarlo por su número de WhatsApp ---
+            let clienteRegistrado = null;
+            if (!isAdmin && !vendedor) {
+                try {
+                    if (sesion && sesion.id_cliente_int) {
+                        const [cc] = await pool.execute(
+                            "SELECT id_cliente, nombres, cedula, clave AS rif, celular, telefono, direccion, zona, vendedor, tipo FROM tab_clientes WHERE id_cliente = ? LIMIT 1",
+                            [sesion.id_cliente_int]
+                        );
+                        clienteRegistrado = (cc && cc[0]) || null;
+                    }
+                    if (!clienteRegistrado) {
+                        clienteRegistrado = await buscarClientePorTelefono(String(from).split('@')[0]);
+                        if (clienteRegistrado) {
+                            await guardarUsuario(from, clienteRegistrado.nombres, clienteRegistrado.id_cliente);
+                            console.log(`[CLIENTE] Registrado detectado: ${clienteRegistrado.nombres} (id ${clienteRegistrado.id_cliente}) vía ${String(from).split('@')[0]}`);
+                        }
+                    }
+                } catch (e) { console.log('[CLIENTE] Error identificando:', e.message); }
+            }
+
             // --- DETECCIÓN DE COMPROBANTE DE TRANSFERENCIA / PAGO (imagen por OCR o texto) ---
             // Se procesa ANTES del flujo de pedidos/productos para no confundir la referencia
             // o cédula del comprobante con un código de producto.
@@ -5412,12 +5481,12 @@ async function startBot() {
                 const esEnvioListaPrecios = mencionaListaPrecios && !esPregunta && !mencionaDespacho;
                 if (esEnvioListaPrecios) {
                     const nomProv = nombreExtraido || pushName || "Proveedor";
-                    await guardarUsuario(from, pushName, 0);
+                    await guardarUsuario(from, (clienteRegistrado && clienteRegistrado.nombres) || pushName, (clienteRegistrado && clienteRegistrado.id_cliente) || 0);
                     await safeSendMessage(from, { text: `📥 *${nomProv}*, hemos recibido su lista de precios. Agradecemos su comunicación y la estaremos revisando. ¡Gracias por contactarnos! 🙏` });
                     return;
                 }
 
-                await guardarUsuario(from, pushName, 0);
+                await guardarUsuario(from, (clienteRegistrado && clienteRegistrado.nombres) || pushName, (clienteRegistrado && clienteRegistrado.id_cliente) || 0);
 
                 // Cliente nuevo preguntando por catálogo / lista de precios / despachos → responder de inmediato
                 if (esPregunta && (mencionaCatalogo || mencionaListaPrecios || mencionaDespacho)) {
@@ -5444,6 +5513,14 @@ async function startBot() {
                 if (esSoloSaludo) {
                     if (isAdmin) {
                         await safeSendMessage(from, { text: '👋 Hola. Escribe *comandos* para ver el menú del gerente.' });
+                        return;
+                    }
+                    if (clienteRegistrado) {
+                        registrarSaludo(from);
+                        try { if (socketBot && isBotReady()) await socketBot.sendPresenceUpdate('composing', from); } catch (e) {}
+                        await new Promise(r => setTimeout(r, 2200 + Math.random() * 1200));
+                        const ficha = await fichaClienteRegistrado(clienteRegistrado);
+                        await safeSendMessage(from, { text: `¡Hola, *${clienteRegistrado.nombres}*! 👋 ${saludoPorHoraCaracas()} ¿En qué le puedo ayudar hoy?${ficha}` });
                         return;
                     }
                     await enviarSaludoHumano(from, nombreExtraido || pushName);
@@ -5480,7 +5557,7 @@ async function startBot() {
             }
 
             if (esSaludo && !esOtraIntencion) {
-                const nombreUsuario = nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || "Usuario";
+                const nombreUsuario = (clienteRegistrado && clienteRegistrado.nombres) || nombreAlmacenado || nombreExtraido || (vendedor ? vendedor.nombre : null) || pushName || "Usuario";
                 const mencionaJuan = text.includes('juan');
                 const mencionaJose = text.includes('jos');
                 const saludoBase = text.startsWith('buenas tardes') ? 'tarde' :
@@ -5507,7 +5584,8 @@ async function startBot() {
                         'tarde': `Buenas tardes, *${nombreUsuario}*. Un placer saludarle. 😊\n\n¿En qué puedo servirle hoy? _Escriba *Menú* para ver todas las opciones._`,
                         'noche': `Buenas noches, *${nombreUsuario}*. Un gusto atenderle. 🌙\n\n¿En qué puedo servirle hoy? _Escriba *Menú* para ver todas las opciones._`
                     };
-                    await safeSendMessage(from, { text: respuestas[saludoBase] });
+                    const fichaSaludo = clienteRegistrado ? await fichaClienteRegistrado(clienteRegistrado) : '';
+                    await safeSendMessage(from, { text: respuestas[saludoBase] + fichaSaludo });
                 }
 
                 // Guardar nombre del cliente si fue extraído del saludo
@@ -7806,6 +7884,21 @@ const server = http.createServer(async (req, res) => {
             const manejado = await atenderConsultaDueno(destino, texto, true);
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: true, texto, manejado }, null, 2));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
+        }
+    } else if (routename === '/test-cliente') {
+        try {
+            const tel = String(query.tel || query.telefono || '').replace(/\D/g, '');
+            if (!tel) {
+                res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                return res.end(JSON.stringify({ ok: false, error: 'indique ?tel=58412...' }, null, 2));
+            }
+            const cliente = await buscarClientePorTelefono(tel);
+            const ficha = cliente ? await fichaClienteRegistrado(cliente) : '';
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, tel, detectado: !!cliente, cliente, ficha }, null, 2));
         } catch (e) {
             res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, error: e.message }, null, 2));
