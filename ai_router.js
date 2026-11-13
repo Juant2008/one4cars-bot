@@ -131,10 +131,15 @@ CRITERIOS DE DECISIÓN
    Si el mensaje incluye un RIF, colócalo en parametros.rif.
 4. Si pide comprar, ordenar o formalizar un pedido, elige "tomar_pedido".
    No prometas precios ni stock: el sistema los confirma.
-5. Si pide una persona, tiene un reclamo o el caso requiere validación
-   manual, elige "asesor".
+5. Usa "asesor" SOLO si el cliente pide explícitamente hablar con una persona
+   (vendedor, humano, operador) o si hay un problema que de verdad requiere
+   validación manual (pago no reflejado, reclamo formal). Una duda, una pregunta
+   rara o un mensaje que no entiendes NO es motivo para "asesor": primero
+   intenta responder.
 6. Si es un saludo, elige "saludo". Si pide el menú, elige "menu".
-7. Si no está claro, elige "aclarar" y escribe una pregunta breve.
+7. Si no está claro, elige "responder" y redacta una respuesta breve, cálida y
+   útil que ayude al cliente a avanzar. Usa "aclarar" solo si de verdad falta
+   un dato imprescindible.
 8. Para conversación general permitida (horarios, garantía, quiénes son,
    agradecimiento), elige "responder" y redacta una respuesta breve.
 9. Nunca inventes enlaces, precios, stock, saldos, fechas ni promociones.
@@ -206,6 +211,9 @@ function coincidenciaLocal(mensaje) {
         for (const f of frases) {
             const nf = normalizarTexto(f);
             if (!nf || nf.length < 3) continue;
+            // Un saludo solo cuenta si el mensaje es corto: "hola, busco repuestos..."
+            // no debe quedarse en un simple saludo.
+            if (a.id === 'saludo' && t.length > 25) continue;
             let score = 0;
             if (t === nf) score = 1;
             else if (t.length <= 60 && (t.startsWith(nf + ' ') || t.endsWith(' ' + nf) || t.includes(' ' + nf + ' '))) score = 0.86;
@@ -229,7 +237,10 @@ function coincidenciaLocal(mensaje) {
 function aplicarGuardas(mensaje, decision) {
     const t = normalizarTexto(mensaje);
     const d = { ...decision, parametros: { ...(decision.parametros || {}) } };
-    if (d.accion === 'responder') {
+    // Si el modelo ya redactó una respuesta sustanciosa, se respeta: no la
+    // sustituimos por una acción de catálogo solo porque menciona "repuestos".
+    const respondioBien = d.accion === 'responder' && String(d.respuesta || '').trim().length >= 60;
+    if (d.accion === 'responder' && !respondioBien) {
         if (/\b(interesado|interesada|me interesa|me interesan|comprar al mayor|compra al mayor|mayorista|distribuidor|soy (una )?tienda|tengo (un )?negocio|tengo (un )?local|comprar al por mayor)\b/.test(t)) {
             return { ...d, accion: 'registro_mayorista', confianza: Math.max(d.confianza, 0.8) };
         }
@@ -242,7 +253,9 @@ function aplicarGuardas(mensaje, decision) {
         if (/\b(pago|pagar|pago movil|transferencia|deposito|cuenta bancaria|datos bancarios|medios de pago)\b/.test(t)) {
             return { ...d, accion: 'medios_pago', confianza: Math.max(d.confianza, 0.7) };
         }
-        if (/\b(precio|stock|disponible|tienen|tiene|busco|repuesto|pieza|filtro|bujia|rodamiento|correa|bomba|amortiguador|pastilla|disco|embrague)\b/.test(t)) {
+        const pideDatoProducto = /\b(precio|precios|cuanto (cuesta|vale|sale)|stock|disponible|disponibilidad|tienen|tienes|venden|hay|busco|necesito|consigo)\b/.test(t);
+        const nombraProducto = /\b(filtro|filtros|bujia|bujias|rodamiento|rodamientos|rolinera|rolineras|correa|correas|bomba|bombas|amortiguador|amortiguadores|pastilla|pastillas|disco|discos|embrague|repuesto|repuestos|pieza|piezas|kit|kits|sensor|sensores|manguera|radiador|polea|poleas|lapiz|lapices|rotula|rotulas|puntas|cana|terminal|bocamaza|homocinetica|cremallera|valvula|catalina|piston|empaque)\b/.test(t);
+        if (pideDatoProducto && nombraProducto) {
             return { ...d, accion: 'consulta_productos', parametros: { ...d.parametros, busqueda: mensaje }, confianza: Math.max(d.confianza, 0.7) };
         }
         if (/\b(donde esta mi pedido|seguimiento|despacho|rastrear|envio|guia)\b/.test(t)) {

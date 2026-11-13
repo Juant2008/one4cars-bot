@@ -4155,6 +4155,17 @@ async function ejecutarAccionRouter(decision, ctx) {
             if (ctx.esAdmin) {
                 return await responderRouter(from, `🤖 No logré interpretar esa consulta.\n\nPrueba con:\n• *pedido estimado de CLIENTE*\n• *qué ha comprado CLIENTE*\n• *record de pago de CLIENTE*\n• *clientes destacados ZONA*\n• *zona con más potencial*\n• *plan de visitas por zona*\n• *estado de cuenta de CLIENTE*\n• *factura 6331*\n\nEscribe *comandos* para ver el menú completo.`);
             }
+            // Si el cliente NO pidió explícitamente un humano, primero intentamos
+            // responder con la IA (razonando y con la personalidad de RODI).
+            const pideHumano = /(hablar\s+con\s+(?:un|una)?\s*(?:asesor|persona|humano|operador|agente|vendedor)|quiero\s+(?:un|una)\s+(?:asesor|persona|humano|operador|agente)|asesor\s+humano|persona\s+real|ati[eé]ndeme|comun[ií]came)/i.test(String(ctx.rawText || ''));
+            if (!pideHumano) {
+                let libre = null;
+                try { libre = await ia.preguntar(ctx.rawText, ctx.dolar || dolarInfo); } catch (e) {}
+                if (libre && String(libre).trim()) {
+                    try { await guardarMensaje(from, 'model', libre); } catch (e) {}
+                    return await responderRouter(from, libre);
+                }
+            }
             await responderRouter(from, accion.respuesta || texto || '');
             try {
                 const adminJids = ADMIN_IDS.map(id => formatWhatsApp(id)).filter(Boolean);
@@ -5021,18 +5032,8 @@ async function startBot() {
                 try { const d = JSON.parse(sesion.datos); nombreAlmacenado = d.nombre_cliente || null; } catch(e) {}
             }
 
-            // --- HORARIO DE ATENCIÓN (solo clientes) ---
-            if (!isAdmin) {
-                const hor = horarioAtencion();
-                if (!hor.abierto) {
-                    const ultimoAviso = ultimoAvisoCerrado.get(from) || 0;
-                    if (Date.now() - ultimoAviso > 4 * 60 * 60 * 1000) {
-                        ultimoAvisoCerrado.set(from, Date.now());
-                        await safeSendMessage(from, { text: '🕐 Gracias por escribir a *ONE4CARS*.\n\nEn este momento estamos fuera de horario de atención (lunes a viernes de 8:00 a.m. a 5:00 p.m. y sábados de 8:00 a.m. a 12:00 m.).\n\nLe atenderemos en nuestro próximo horario. ¡Gracias por su paciencia!' });
-                    }
-                    return;
-                }
-            }
+            // --- ATENCIÓN 24/7: el bot responde a cualquier hora ---
+            // (Se eliminó el bloqueo por horario: antes decía "fuera de horario" y no atendía.)
 
             // --- DETECCIÓN DE FRUSTRACIÓN O PREGUNTA REPETIDA → ASESOR HUMANO ---
             if (!isAdmin) {
